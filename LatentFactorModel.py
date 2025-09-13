@@ -8,17 +8,27 @@ from sklearn.model_selection import train_test_split
 import psycopg2
 
 class LatentFactorModel:
-    def __init__(self, ratings, item_texts):
-        self.ratings = ratings
-        self.item_texts = item_texts
-        self.tokenizer, self.bert_model = self.load_bert()
-        self.item_emb_dict = self.build_item_embeddings()
-        self.k = next(iter(self.item_emb_dict.values())).shape[0]
-        self.user_emb_dict, self.users = self.build_user_embeddings(self.ratings, self.item_emb_dict)
-        self.n_users = len(self.users)
-        self.n_items = len(self.item_texts)
-        self.P, self.Q, self.b_u, self.b_i, self.mu = self.init_latent_model()
-        self.inferred_prefs = self.compute_inferred_preferences()
+    def __init__(self, ratings, item_texts, connection=None):
+        if ratings is None and item_texts is None and connection is None:
+            raise ValueError("Either ratings and item_texts or connection must be provided.")
+        if (ratings is not None or item_texts is not None) and connection is not None:
+            raise ValueError("Provide either ratings and item_texts or connection, not both.")
+        
+        if connection is None:
+            self.connection = None
+            self.ratings = ratings
+            self.item_texts = item_texts
+            self.tokenizer, self.bert_model = self.load_bert()
+            self.item_emb_dict = self.build_item_embeddings()
+            self.k = next(iter(self.item_emb_dict.values())).shape[0]
+            self.user_emb_dict, self.users = self.build_user_embeddings(self.ratings, self.item_emb_dict)
+            self.n_users = len(self.users)
+            self.n_items = len(self.item_texts)
+            self.P, self.Q, self.b_u, self.b_i, self.mu = self.init_latent_model()
+            self.inferred_prefs = self.compute_inferred_preferences()
+        else:
+            self.connection = connection
+            self.load_model_from_db()
 
     def load_bert(self):
         tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
@@ -129,7 +139,7 @@ class LatentFactorModel:
         return total_loss + reg
     
     def train(self, max_epochs=500, lr=0.001, weight=0.3, lam=0.01, tol=1e-6, save=False, connection=None):
-        if save and connection is None:
+        if save and conn is None:
             raise ValueError("Database connection is required to save the model.")
 
         prev_obj = float("inf")
@@ -157,14 +167,14 @@ class LatentFactorModel:
             
             prev_obj = obj
         
-        if save:
-            self.write_model_to_db(connection, lr, weight, lam)
+        if save and conn is not None:
+            self.write_model_to_db(conn, lr, weight, lam)
 
     def predict_rating(self, user, item):
         return self.compute_prediction(user, item)
     
-    def write_model_to_db(self, connection, lr=0.001, weight=0.3, lam=0.01):
-        cur = connection.cursor()
+    def write_model_to_db(self, lr=0.001, weight=0.3, lam=0.01):
+        cur = self.connection.cursor()
 
         cur.execute(
             'INSERT INTO "Model" ("NumFactors", "GlobalBias", "LearningRate", "RegularizationRate", "InferredPrefWeight") '
@@ -208,7 +218,91 @@ class LatentFactorModel:
                 (float(self.b_i[item]), self.Q[item].tolist(), model_id, item)
             )
             
-        connection.commit()
+        self.connection.commit()
+        
+    def load_model_from_db(self):
+        cur = self.connection.cursor()
+    
+        self.tokenizer, self.bert_model = self.load_bert()
+        cur.execute('SELECT * FROM "Item"')
+        rows = cur.fetchall()
+        self.item_texts = {row[0]: row[2] for row in rows}
+        self.item_emb_dict = {}
+        # load item embeddings from db if exist, otherwise compute
+        for row in rows:
+            item_id = row[0]
+            description = row[2]
+            emb_from_db = row[3]
+            if emb_from_db is not None:
+                embedding = np.array(emb_from_db, dtype=float)
+            else:
+                embedding = self.get_embedding(description)
+            self.item_emb_dict[item_id] = embedding
+        
+        self.k = next(iter(self.item_emb_dict.values())).shape[0]
+        
+        cur.execute('SELECT * FROM "get_all_unique_ratings"()')
+        self.ratings = []
+        rows = cur.fetchall()
+        for row in rows:
+            self.ratings.append((row[1], row[2], float(row[0])))
+            
+        # take the user embeddings from db if exist, otherwise compute
+        self.user_emb_dict = {}
+        cur.execute('SELECT "UserID", "UserEmbeddingVector" FROM "User"')
+        for row in cur.fetchall():
+            user_id = row[0]
+            emb_from_db = row[1]
+            if emb_from_db is not None:
+                embedding = np.array(emb_from_db, dtype=float)
+            else:
+                user_ratings = [(u, i, r) for u, i, r in self.ratings if u == user_id]
+                if user_ratings:
+                    user_emb_dict, _ = self.build_user_embeddings(user_ratings, self.item_emb_dict)
+                    embedding = user_emb_dict[user_id]
+                else:
+                    embedding = np.zeros(self.k)
+            self.user_emb_dict[user_id] = embedding
+
+        # rebuild user embedding for users that have new ratings
+        new_user_ids = set()
+        cur.execute('SELECT * from "get_new_ratings"()')
+        rows = cur.fetchall()
+        for row in rows:
+            # userid, itemid, rating
+            new_user_ids.add(row[1])
+
+        for user_id in new_user_ids:
+            cur.execute("""
+                SELECT DISTINCT ON (r."UserID", r."ItemID")
+                    r."UserID",
+                    r."ItemID",
+                    r."RatingValue"
+                FROM "Rating" r
+                WHERE r."UserID" = %s
+                ORDER BY r."UserID", r."ItemID", r."created_at" DESC;
+            """, (user_id,))
+            rows = cur.fetchall()
+            
+            ratings_for_user = [(r[0], r[1], float(r[2])) for r in rows]  # (user, item, rating)
+            user_emb_dict, _ = self.build_user_embeddings(ratings_for_user, self.item_emb_dict)
+            embedding = user_emb_dict[user_id]
+            
+            avg_rating = np.mean([r[2] for r in ratings_for_user])
+            
+            self.user_emb_dict[user_id] = embedding
+            
+            cur.execute(
+                'UPDATE "User" SET "UserEmbeddingVector" = %s, "LikingThreshold" = %s WHERE "UserID" = %s',
+                (embedding.tolist(), float(avg_rating), user_id)
+            )
+            
+        self.users = list(self.user_emb_dict.keys())
+        self.n_users = len(self.users)
+        self.n_items = len(self.item_texts)
+        self.P, self.Q, self.b_u, self.b_i, self.mu = self.init_latent_model()
+        self.inferred_prefs = self.compute_inferred_preferences()
+        self.connection.commit()
     
 if __name__ == "__main__":
     np.random.seed(42)
@@ -268,7 +362,7 @@ if __name__ == "__main__":
     train_ratings, test_ratings = train_test_split(ratings, test_size=0.2, random_state=42)
     
     model = LatentFactorModel(train_ratings, item_texts)
-    model.train(max_epochs=500, lr=0.001, weight=0.3, lam=0.01, save=True, connection=conn)
+    model.train(max_epochs=500, lr=0.001, weight=0.3, lam=0.01, save=False)
     # for (u, i, r) in test_ratings:
     #     pred = model.predict_rating(u, i)
     #     print(f"{u}-{i}: true={r}, pred={pred:.2f}")

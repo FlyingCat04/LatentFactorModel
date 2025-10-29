@@ -165,7 +165,7 @@ class LatentFactorModel(nn.Module):
             else:
                 self.user_emb_dict[user_id] = np.zeros(k_dim_bert)
 
-    def load_ratings_from_db(self, limit_total=1000000, ratio=1):
+    def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
         cur = self.connection.cursor()
         try:
             cur.execute("""
@@ -505,7 +505,7 @@ class LatentFactorModel(nn.Module):
             print(f"⚠️ Inferred preferences have no variance. Scaling skipped. Using constant value: {mu_val:.2f}")
             return np.full(len(self.ratings), mu_val)
 
-    def train_model(self, epochs=500, batch_size=256):
+    def train_model(self, epochs=500, batch_size=128):
         if not self.ratings: print("⚠️ No training data. Skipping."); return
         if self.model is None: print("⚠️ Model not initialized. Skipping."); return
         if self.optimizer is None: print("⚠️ Optimizer not initialized. Skipping."); return
@@ -723,7 +723,7 @@ if __name__ == "__main__":
     try:
         model = LatentFactorModel(
             connection=conn,
-            train_mode='load',
+            train_mode='train',
             model_id=1,
             k=90,
             lr=0.001,
@@ -731,55 +731,57 @@ if __name__ == "__main__":
             weight=0.3
         )
         
-        test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
-        if not test_ratings_to_use:
-            print("⚠️ No test ratings loaded. Evaluation will be skipped.")
-
-        if model.model is not None:
-            print("\n--- Starting Model Training ---")
-            model.train_model(epochs=500, batch_size=256)
-        else:
-            print("❌ Model initialization failed. Skipping training.")
-
-        if model.model is not None:
-            print("\n--- Saving Model State ---")
-            model.write_model_to_db()
-        else:
-            print("Skipping save.")
+        print(model.predict(1, 720))
         
-        if test_ratings_to_use:
-            print("\n--- Evaluating Model ---")
+        # test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
+        # if not test_ratings_to_use:
+        #     print("⚠️ No test ratings loaded. Evaluation will be skipped.")
 
-            def compute_rmse(model_instance, ratings_set):
-                if not ratings_set: return float('nan')
-                squared_error = 0.0
-                count = 0
-                for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-                    pred = model_instance.predict(user, item)
-                    squared_error += (r_ui - pred) ** 2
-                    if count < 20:
-                        print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
-                        count += 1
-                if not ratings_set: return 0.0
-                mse = squared_error / len(ratings_set)
-                rmse = np.sqrt(mse)
-                return rmse
+        # if model.model is not None:
+        #     print("\n--- Starting Model Training ---")
+        #     model.train_model(epochs=500, batch_size=256)
+        # else:
+        #     print("❌ Model initialization failed. Skipping training.")
 
-            def compute_mae(model_instance, ratings_set):
-                if not ratings_set: return float('nan')
-                absolute_error = 0.0
-                for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
-                    pred = model_instance.predict(user, item)
-                    absolute_error += abs(r_ui - pred)
-                if not ratings_set: return 0.0
-                mae = absolute_error / len(ratings_set)
-                return mae
+        # if model.model is not None:
+        #     print("\n--- Saving Model State ---")
+        #     model.write_model_to_db()
+        # else:
+        #     print("Skipping save.")
+        
+        # if test_ratings_to_use:
+        #     print("\n--- Evaluating Model ---")
 
-            test_rmse = compute_rmse(model, test_ratings_to_use)
-            print(f"RMSE on test set: {test_rmse:.4f}")
+        #     def compute_rmse(model_instance, ratings_set):
+        #         if not ratings_set: return float('nan')
+        #         squared_error = 0.0
+        #         count = 0
+        #         for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
+        #             pred = model_instance.predict(user, item)
+        #             squared_error += (r_ui - pred) ** 2
+        #             if count < 20:
+        #                 print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
+        #                 count += 1
+        #         if not ratings_set: return 0.0
+        #         mse = squared_error / len(ratings_set)
+        #         rmse = np.sqrt(mse)
+        #         return rmse
 
-            test_mae = compute_mae(model, test_ratings_to_use)
-            print(f"MAE on test set: {test_mae:.4f}")
+        #     def compute_mae(model_instance, ratings_set):
+        #         if not ratings_set: return float('nan')
+        #         absolute_error = 0.0
+        #         for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
+        #             pred = model_instance.predict(user, item)
+        #             absolute_error += abs(r_ui - pred)
+        #         if not ratings_set: return 0.0
+        #         mae = absolute_error / len(ratings_set)
+        #         return mae
+
+        #     test_rmse = compute_rmse(model, test_ratings_to_use)
+        #     print(f"RMSE on test set: {test_rmse:.4f}")
+
+        #     test_mae = compute_mae(model, test_ratings_to_use)
+        #     print(f"MAE on test set: {test_mae:.4f}")
 
     except ValueError as ve: 
         print(f"\n❌ Initialization/Data Error: {ve}")

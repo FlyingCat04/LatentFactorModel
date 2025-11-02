@@ -18,7 +18,7 @@ class LatentFactorModel(nn.Module):
         items=None,
         k=90,
         weight=0.3,
-        lam=0.01,
+        lam=0.001,
         lr=0.01,
         model_id=1,
         train_mode='train',
@@ -58,11 +58,14 @@ class LatentFactorModel(nn.Module):
 
         if self.train_mode == 'load':
             print("--- Loading Existing Model ---")
+            self.load_user_item_from_db()
+            self.user2idx = {u: i for i, u in enumerate(self.users)}
+            self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             self.load_model_from_db(model_id=model_id)
             if self.model is None or not self.users or not self.items_list:
                 raise ValueError("❌ Failed to load model state completely.")
 
-        else: # train_mode == 'train'
+        else:
             if self.k is None:
                 raise ValueError("❌ Parameter 'k' (e.g., 90) is required for training.")
 
@@ -83,9 +86,10 @@ class LatentFactorModel(nn.Module):
                 raise ValueError("❌ No users or items found in the training ratings.")
 
             self.load_user_item_embeddings_from_db(users_in_train, items_in_train)
-
-            self.users = list(self.user_emb_dict.keys())
-            self.items_list = list(self.item_emb_dict.keys())
+            self.load_user_item_from_db()
+            
+            # self.users = sorted(list(self.user_emb_dict.keys()))
+            # self.items_list = sorted(list(self.item_emb_dict.keys()))
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             self.compute_user_embeddings()
@@ -164,7 +168,33 @@ class LatentFactorModel(nn.Module):
                     self.user_emb_dict[user_id] = t_u
             else:
                 self.user_emb_dict[user_id] = np.zeros(k_dim_bert)
-
+                
+    def load_user_item_from_db(self):
+        cur = self.connection.cursor()
+        try:
+            cur.execute("""
+                SELECT "UserID"
+                From "User"
+                ORDER BY "UserID"
+            """, ())
+            rows = cur.fetchall()
+        except Exception as e:
+            raise
+            
+        self.users = [str(row[0]) for row in rows]
+        
+        try:
+            cur.execute("""
+                SELECT "ItemID"
+                From "Item"
+                ORDER BY "ItemID"
+            """, ())
+            rows = cur.fetchall()
+        except Exception as e:
+            raise
+        
+        self.items_list = [str(row[0]) for row in rows]
+        
     def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
         cur = self.connection.cursor()
         try:
@@ -191,8 +221,8 @@ class LatentFactorModel(nn.Module):
             if train_count == 0: train_count = total
             if train_count == total: test_ratings = []
 
-        self.ratings = [(u, i, float(r)) for u, i, r in rows[:train_count]]
-        self.test_ratings = [(u, i, float(r)) for u, i, r in rows[train_count:]]
+        self.ratings = [(str(u), str(i), float(r)) for u, i, r in rows[:train_count]]
+        self.test_ratings = [(str(u), str(i), float(r)) for u, i, r in rows[train_count:]]
 
     def load_user_item_embeddings_from_db(self, users_to_load, items_to_load):
         if not users_to_load or not items_to_load:
@@ -210,7 +240,7 @@ class LatentFactorModel(nn.Module):
                 cur.execute("""
                     SELECT "ItemID", "Description", "ItemEmbeddingVector"
                     FROM "Item"
-                    WHERE "ItemID" = ANY(%s)
+                    WHERE "ItemID" = ANY(%s::int[])
                 """, (chunk,))
                 rows_chunk = cur.fetchall()
                 all_rows_items.extend(rows_chunk)
@@ -232,7 +262,8 @@ class LatentFactorModel(nn.Module):
                 except Exception as e:
                     missing_items_info.append((item_id, desc))
             else:
-                missing_items_info.append((item_id, desc))
+                if desc is not None or desc != "":
+                    missing_items_info.append((item_id, desc))
             processed_item_ids.add(item_id)
 
         items_not_in_db_table = set(items_to_load) - processed_item_ids
@@ -252,8 +283,7 @@ class LatentFactorModel(nn.Module):
                     if bert_emb.shape[0] != k_bert_dim:
                         bert_emb = np.zeros(k_bert_dim)
                     self.item_emb_dict[item_id] = bert_emb
-
-
+        
         all_rows_users = []
         users_list_for_query = list(users_to_load)
         for i in range(0, len(users_list_for_query), CHUNK_SIZE):
@@ -298,25 +328,26 @@ class LatentFactorModel(nn.Module):
     def load_model_from_db(self, model_id):
         cur = self.connection.cursor()
         
-        items_list_temp = []
         item_factors = {}
         item_biases = {}
         temp_k_from_factors = None
 
         try:
             cur.execute("""
-                SELECT i."ItemID", f."ItemBias", f."ItemFactors"
-                FROM "Item" i
-                LEFT JOIN "ItemFactor" f ON i."ItemID" = f."ItemID" AND f."Model" = %s
+                SELECT "ItemID", "ItemBias", "ItemFactors"
+                FROM "ItemFactor"
+                WHERE "ModelID" = %s
+                ORDER BY "ItemID"
             """, (model_id,))
             rows_items = cur.fetchall()
         except Exception as e:
             print(f"❌ Error loading items/factors: {e}")
             raise
-        print(f"   Found {len(rows_items)} items in 'Item' table.")
 
         for item_id, bias, factors in rows_items:
-            items_list_temp.append(item_id)
+            item_id = str(item_id)
+            if item_id not in self.item2idx:
+                continue
             
             if bias is not None and factors is not None:
                 item_biases[item_id] = float(bias)
@@ -328,16 +359,14 @@ class LatentFactorModel(nn.Module):
             self.k = temp_k_from_factors
             print(f"   Inferred K={self.k} from loaded item factors.")
 
-        self.items_list = items_list_temp
-        
-        users_list_temp = []
         user_factors = {}
         user_biases = {}
         try:
             cur.execute("""
-                SELECT u."UserID", f."UserBias", f."UserFactors"
-                FROM "User" u
-                LEFT JOIN "UserFactor" f ON u."UserID" = f."UserID" AND f."Model" = %s
+                SELECT "UserID", "UserBias", "UserFactors"
+                FROM "UserFactor"
+                WHERE "ModelID" = %s
+                ORDER BY "UserID"
             """, (model_id,))
             rows_users = cur.fetchall()
         except Exception as e:
@@ -345,30 +374,26 @@ class LatentFactorModel(nn.Module):
             raise
 
         for user_id, bias, factors in rows_users:
-            users_list_temp.append(user_id)
+            if user_id not in self.user2idx:
+                continue
             
             if bias is not None and factors is not None:
                 user_biases[user_id] = float(bias)
                 user_factors[user_id] = np.array(factors, dtype=float)
                 if self.k is None and len(user_factors[user_id]) > 0:
                     self.k = len(user_factors[user_id])
-                    print(f"   Inferred K={self.k} from loaded user factors.")
+                    print(f"Inferred K={self.k} from loaded user factors.")
 
         if self.k is None:
-             raise ValueError("❌ Cannot determine K from loaded factors. Model load failed.")
-
-        self.users = users_list_temp
-
-        self.user2idx = {u: i for i, u in enumerate(self.users)}
-        self.item2idx = {i: j for j, i in enumerate(self.items_list)}
+            raise ValueError("❌ Cannot determine K from loaded factors. Model load failed.")
 
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
-        cur.execute('SELECT AVG("RatingValue") FROM "Rating"')
+        cur.execute('SELECT "AverageRating" FROM "Model" WHERE "ModelID"=%s', (model_id,))
         mu_row = cur.fetchone()
         self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3
-        
+
         self.model = self.UEIEModel(n_users_loaded, n_items_loaded, self.k, self.mu).to(self.device)
         self.model.eval()
 
@@ -495,7 +520,6 @@ class LatentFactorModel(nn.Module):
             scaler = MinMaxScaler(feature_range=(1, 5))
             try:
                 scaled_inferred = scaler.fit_transform(inferred.reshape(-1, 1)).flatten()
-                print(f"✅ Computed and scaled z_ui. Min: {scaled_inferred.min():.2f}, Max: {scaled_inferred.max():.2f}, Mean: {scaled_inferred.mean():.2f}")
                 return scaled_inferred
             except ValueError as e:
                 print(f"⚠️ Error scaling z_ui: {e}. Using clipped unscaled values.")
@@ -505,7 +529,7 @@ class LatentFactorModel(nn.Module):
             print(f"⚠️ Inferred preferences have no variance. Scaling skipped. Using constant value: {mu_val:.2f}")
             return np.full(len(self.ratings), mu_val)
 
-    def train_model(self, epochs=500, batch_size=128):
+    def train_model(self, epochs=500, batch_size=256):
         if not self.ratings: print("⚠️ No training data. Skipping."); return
         if self.model is None: print("⚠️ Model not initialized. Skipping."); return
         if self.optimizer is None: print("⚠️ Optimizer not initialized. Skipping."); return
@@ -578,7 +602,7 @@ class LatentFactorModel(nn.Module):
             final_reg_loss = 0.5 * self.lam * (reg_p + reg_q + reg_bu + reg_bi).item()
             avg_total_loss_to_track = avg_main_loss + final_reg_loss / n
             
-            print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f} (Main: {avg_main_loss:.4f}, Reg: {final_reg_loss:.4f})")
+            print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f}")
 
             if abs(prev_avg_loss - avg_total_loss_to_track) < tolerance:
                 print(f"✅ Early stopping at epoch {epoch+1} (|Δloss|={abs(prev_avg_loss - avg_total_loss_to_track):.6e} < {tolerance})")
@@ -591,10 +615,10 @@ class LatentFactorModel(nn.Module):
         if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
         if self.connection is None: raise ValueError("❌ DB connection required.")
         if self.model is None: print("⚠️ Model not trained. Cannot save."); return
-
+        
         cur = self.connection.cursor()
         self.model.eval()
-
+        
         update_count_u, update_count_i = 0, 0
         try:
             for user_id in self.users:
@@ -623,34 +647,49 @@ class LatentFactorModel(nn.Module):
 
             user_factor_data = []
             item_factor_data = []
+            
+            users_in_train = set(u for u, _, _ in self.ratings)
+            items_in_train = set(i for _, i, _ in self.ratings)
 
             for user_id in self.users:
-                if user_id in self.user2idx:
+                if user_id in users_in_train:
                     idx = self.user2idx[user_id]
-                    if 0 <= idx < len(all_user_biases) and 0 <= idx < len(all_user_factors):
-                        user_factor_data.append((
-                            user_id,
-                            float(all_user_biases[idx]),
-                            all_user_factors[idx].tolist(),
-                            self.model_id
-                        ))
+                    user_factor_data.append((
+                        user_id,
+                        float(all_user_biases[idx]),
+                        all_user_factors[idx].tolist(),
+                        self.model_id
+                    ))
+                else:
+                    user_factor_data.append((
+                        user_id,
+                        0.0,
+                        [0.0]*self.k,
+                        self.model_id
+                    ))
             
             for item_id in self.items_list:
-                if item_id in self.item2idx:
+                if item_id in items_in_train:
                     idx = self.item2idx[item_id]
-                    if 0 <= idx < len(all_item_biases) and 0 <= idx < len(all_item_factors):
-                        item_factor_data.append((
-                            item_id,
-                            float(all_item_biases[idx]),
-                            all_item_factors[idx].tolist(),
-                            self.model_id
-                        ))
+                    item_factor_data.append((
+                        item_id,
+                        float(all_item_biases[idx]),
+                        all_item_factors[idx].tolist(),
+                        self.model_id
+                    ))
+                else:
+                    item_factor_data.append((
+                        item_id,
+                        0.0,
+                        [0.0]*self.k,
+                        self.model_id
+                    ))
 
             if user_factor_data:
                 sql_user = """
-                INSERT INTO "UserFactor" ("UserID", "UserBias", "UserFactors", "Model")
+                INSERT INTO "UserFactor" ("UserID", "UserBias", "UserFactors", "ModelID")
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("UserID", "Model") DO UPDATE SET 
+                ON CONFLICT ("UserID", "ModelID") DO UPDATE SET 
                     "UserBias" = EXCLUDED."UserBias",
                     "UserFactors" = EXCLUDED."UserFactors";
                 """
@@ -658,20 +697,51 @@ class LatentFactorModel(nn.Module):
 
             if item_factor_data:
                 sql_item = """
-                INSERT INTO "ItemFactor" ("ItemID", "ItemBias", "ItemFactors", "Model")
+                INSERT INTO "ItemFactor" ("ItemID", "ItemBias", "ItemFactors", "ModelID")
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("ItemID", "Model") DO UPDATE SET
+                ON CONFLICT ("ItemID", "ModelID") DO UPDATE SET
                     "ItemBias" = EXCLUDED."ItemBias",
                     "ItemFactors" = EXCLUDED."ItemFactors";
                 """
                 psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
+            
+            cur = self.connection.cursor()
+            cur.execute("""
+                UPDATE "Model" SET "AverageRating"=%s, "modified_at"=NOW() WHERE "ModelID"=%s 
+            """, (float(self.mu), self.model_id))
+            
             self.connection.commit()
+            print(len(self.user2idx))
+            print(len(self.item2idx))
+
 
         except Exception as e:
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")
             self.connection.rollback()
+    
+    def debug_weights_to_db(self, user, item):
+        if self.model is None:
+            print("Model not initialized.")
+            return
 
-    def predict(self, user, item):
+        u_idx_val = self.user2idx.get(user)
+        i_idx_val = self.item2idx.get(item)
+
+        if u_idx_val is not None:
+            p_vec = self.model.P.weight[u_idx_val].cpu().numpy()
+            b_u_val = self.model.b_u.weight[u_idx_val].item()
+            print(f"User {user} -> idx {u_idx_val}: b_u={b_u_val}, P={p_vec}")
+        else:
+            print(f"User {user} not in user2idx")
+
+        if i_idx_val is not None:
+            q_vec = self.model.Q.weight[i_idx_val].cpu().numpy()
+            b_i_val = self.model.b_i.weight[i_idx_val].item()
+            print(f"Item {item} -> idx {i_idx_val}: b_i={b_i_val}, Q={q_vec}")
+        else:
+            print(f"Item {item} not in item2idx")
+
+    def predict(self, user, item, p):
         if self.model is None:
             return self.mu if self.mu else 3.0
 
@@ -679,14 +749,17 @@ class LatentFactorModel(nn.Module):
         with torch.no_grad():
             u_idx_val = self.user2idx.get(user)
             i_idx_val = self.item2idx.get(item)
-
+            
+            if p == 1:
+                print(u_idx_val, i_idx_val)
+                self.debug_weights_to_db(user, item)
             if u_idx_val is None:
                 if i_idx_val is not None:
                     i_idx = torch.tensor([i_idx_val], device=self.device, dtype=torch.long)
                     b_i = self.model.b_i(i_idx).squeeze().item()
                     prediction = self.mu + b_i
                 else:
-                     prediction = self.mu
+                    prediction = self.mu
                 return np.clip(prediction, 1.0, 5.0)
 
             if i_idx_val is None:
@@ -698,6 +771,7 @@ class LatentFactorModel(nn.Module):
             u_idx = torch.tensor([u_idx_val], device=self.device, dtype=torch.long)
             i_idx = torch.tensor([i_idx_val], device=self.device, dtype=torch.long)
             prediction = self.model(u_idx, i_idx).item()
+            
             return np.clip(prediction, 1.0, 5.0)
 
 if __name__ == "__main__":
@@ -713,7 +787,13 @@ if __name__ == "__main__":
 
     conn = None
     try:
-        conn = psycopg2.connect(dbname=DB_NAME, user=USER, host=HOST, password=PASSWORD)
+        conn = psycopg2.connect(
+            dbname=DB_NAME, 
+            user=USER, 
+            host=HOST, 
+            password=PASSWORD,
+            options="-c search_path=dbo,goodreads"
+            )
         import psycopg2.extras
         print("✅ Database connected successfully.")
     except Exception as e:
@@ -723,7 +803,7 @@ if __name__ == "__main__":
     try:
         model = LatentFactorModel(
             connection=conn,
-            train_mode='train',
+            train_mode='load',
             model_id=1,
             k=90,
             lr=0.001,
@@ -731,7 +811,7 @@ if __name__ == "__main__":
             weight=0.3
         )
         
-        print(model.predict(1, 720))
+        print(model.predict("cce9b2a37665aa5aa978d2dc622066ba", "7824768", 1))
         
         # test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
         # if not test_ratings_to_use:
@@ -739,7 +819,7 @@ if __name__ == "__main__":
 
         # if model.model is not None:
         #     print("\n--- Starting Model Training ---")
-        #     model.train_model(epochs=500, batch_size=256)
+        #     model.train_model(epochs=10, batch_size=512)
         # else:
         #     print("❌ Model initialization failed. Skipping training.")
 
@@ -757,9 +837,13 @@ if __name__ == "__main__":
         #         squared_error = 0.0
         #         count = 0
         #         for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-        #             pred = model_instance.predict(user, item)
+        #             pred = 0.0
+        #             if count < 50:
+        #                 pred = model_instance.predict(user, item, 1)
+        #             else:
+        #                 pred = model_instance.predict(user, item, 0)
         #             squared_error += (r_ui - pred) ** 2
-        #             if count < 20:
+        #             if count < 50:
         #                 print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
         #                 count += 1
         #         if not ratings_set: return 0.0

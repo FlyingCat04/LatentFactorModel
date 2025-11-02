@@ -109,17 +109,25 @@ class LatentFactorModel(nn.Module):
             print("✅ Initialization complete and ready for training.")
 
     class UEIEModel(nn.Module):
-        def __init__(self, n_users, n_items, k, mu):
+        def __init__(self, n_users, n_items, k, mu, P_init=None, Q_init=None, b_u_init=None, b_i_init=None):
             super().__init__()
             self.P = nn.Embedding(n_users, k)
             self.Q = nn.Embedding(n_items, k)
             self.b_u = nn.Embedding(n_users, 1)
             self.b_i = nn.Embedding(n_items, 1)
             self.mu = mu
-            nn.init.xavier_uniform_(self.P.weight)
-            nn.init.xavier_uniform_(self.Q.weight)
-            nn.init.zeros_(self.b_u.weight)
-            nn.init.zeros_(self.b_i.weight)
+            
+            if P_init is not None:
+                with torch.no_grad():
+                    self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
+                    self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
+                    self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
+                    self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
+            else:
+                nn.init.xavier_uniform_(self.P.weight)
+                nn.init.xavier_uniform_(self.Q.weight)
+                nn.init.zeros_(self.b_u.weight)
+                nn.init.zeros_(self.b_i.weight)
 
         def forward(self, user_idx, item_idx):
             p_u = self.P(user_idx)
@@ -398,26 +406,26 @@ class LatentFactorModel(nn.Module):
         self.model = self.UEIEModel(n_users_loaded, n_items_loaded, self.k, self.mu).to(self.device)
         self.model.eval()
 
-        with torch.no_grad():
-            loaded_params = 0
-            for user_id, bias in user_biases.items():
-                if user_id in self.user2idx:
-                    self.model.b_u.weight[self.user2idx[user_id]] = bias
-                    loaded_params +=1
-            for item_id, bias in item_biases.items():
-                if item_id in self.item2idx:
-                    self.model.b_i.weight[self.item2idx[item_id]] = bias
-                    loaded_params +=1
-            for user_id, factors in user_factors.items():
-                 if user_id in self.user2idx:
-                    if len(factors) == self.k:
-                        self.model.P.weight[self.user2idx[user_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
-                        loaded_params += self.k
-            for item_id, factors in item_factors.items():
-                if item_id in self.item2idx:
-                    if len(factors) == self.k:
-                        self.model.Q.weight[self.item2idx[item_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
-                        loaded_params += self.k
+        # with torch.no_grad():
+        #     loaded_params = 0
+        #     for user_id, bias in user_biases.items():
+        #         if user_id in self.user2idx:
+        #             self.model.b_u.weight[self.user2idx[user_id]] = bias
+        #             loaded_params +=1
+        #     for item_id, bias in item_biases.items():
+        #         if item_id in self.item2idx:
+        #             self.model.b_i.weight[self.item2idx[item_id]] = bias
+        #             loaded_params +=1
+        #     for user_id, factors in user_factors.items():
+        #          if user_id in self.user2idx:
+        #             if len(factors) == self.k:
+        #                 self.model.P.weight[self.user2idx[user_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
+        #                 loaded_params += self.k
+        #     for item_id, factors in item_factors.items():
+        #         if item_id in self.item2idx:
+        #             if len(factors) == self.k:
+        #                 self.model.Q.weight[self.item2idx[item_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
+        #                 loaded_params += self.k
         print(f"✅ Loaded Factors/Biases into PyTorch Model for Prediction.")
 
     def load_bert(self):
@@ -781,7 +789,7 @@ if __name__ == "__main__":
     try:
         model = LatentFactorModel(
             connection=conn,
-            train_mode='load',
+            train_mode='train',
             model_id=1,
             k=90,
             lr=0.001,
@@ -789,61 +797,61 @@ if __name__ == "__main__":
             weight=0.3
         )
         
-        print(model.predict("cce9b2a37665aa5aa978d2dc622066ba", "7824768", 1))
+        # print(model.predict("cce9b2a37665aa5aa978d2dc622066ba", "7824768", 1))
         
-        # test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
-        # if not test_ratings_to_use:
-        #     print("⚠️ No test ratings loaded. Evaluation will be skipped.")
+        test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
+        if not test_ratings_to_use:
+            print("⚠️ No test ratings loaded. Evaluation will be skipped.")
 
-        # if model.model is not None:
-        #     print("\n--- Starting Model Training ---")
-        #     model.train_model(epochs=10, batch_size=512)
-        # else:
-        #     print("❌ Model initialization failed. Skipping training.")
+        if model.model is not None:
+            print("\n--- Starting Model Training ---")
+            model.train_model(epochs=10, batch_size=512)
+        else:
+            print("❌ Model initialization failed. Skipping training.")
 
-        # if model.model is not None:
-        #     print("\n--- Saving Model State ---")
-        #     model.write_model_to_db()
-        # else:
-        #     print("Skipping save.")
+        if model.model is not None:
+            print("\n--- Saving Model State ---")
+            model.write_model_to_db()
+        else:
+            print("Skipping save.")
         
-        # if test_ratings_to_use:
-        #     print("\n--- Evaluating Model ---")
+        if test_ratings_to_use:
+            print("\n--- Evaluating Model ---")
 
-        #     def compute_rmse(model_instance, ratings_set):
-        #         if not ratings_set: return float('nan')
-        #         squared_error = 0.0
-        #         count = 0
-        #         for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-        #             pred = 0.0
-        #             if count < 50:
-        #                 pred = model_instance.predict(user, item, 1)
-        #             else:
-        #                 pred = model_instance.predict(user, item, 0)
-        #             squared_error += (r_ui - pred) ** 2
-        #             if count < 50:
-        #                 print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
-        #                 count += 1
-        #         if not ratings_set: return 0.0
-        #         mse = squared_error / len(ratings_set)
-        #         rmse = np.sqrt(mse)
-        #         return rmse
+            def compute_rmse(model_instance, ratings_set):
+                if not ratings_set: return float('nan')
+                squared_error = 0.0
+                count = 0
+                for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
+                    pred = 0.0
+                    if count < 50:
+                        pred = model_instance.predict(user, item, 1)
+                    else:
+                        pred = model_instance.predict(user, item, 0)
+                    squared_error += (r_ui - pred) ** 2
+                    if count < 50:
+                        print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
+                        count += 1
+                if not ratings_set: return 0.0
+                mse = squared_error / len(ratings_set)
+                rmse = np.sqrt(mse)
+                return rmse
 
-        #     def compute_mae(model_instance, ratings_set):
-        #         if not ratings_set: return float('nan')
-        #         absolute_error = 0.0
-        #         for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
-        #             pred = model_instance.predict(user, item)
-        #             absolute_error += abs(r_ui - pred)
-        #         if not ratings_set: return 0.0
-        #         mae = absolute_error / len(ratings_set)
-        #         return mae
+            def compute_mae(model_instance, ratings_set):
+                if not ratings_set: return float('nan')
+                absolute_error = 0.0
+                for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
+                    pred = model_instance.predict(user, item)
+                    absolute_error += abs(r_ui - pred)
+                if not ratings_set: return 0.0
+                mae = absolute_error / len(ratings_set)
+                return mae
 
-        #     test_rmse = compute_rmse(model, test_ratings_to_use)
-        #     print(f"RMSE on test set: {test_rmse:.4f}")
+            test_rmse = compute_rmse(model, test_ratings_to_use)
+            print(f"RMSE on test set: {test_rmse:.4f}")
 
-        #     test_mae = compute_mae(model, test_ratings_to_use)
-        #     print(f"MAE on test set: {test_mae:.4f}")
+            test_mae = compute_mae(model, test_ratings_to_use)
+            print(f"MAE on test set: {test_mae:.4f}")
 
     except ValueError as ve: 
         print(f"\n❌ Initialization/Data Error: {ve}")

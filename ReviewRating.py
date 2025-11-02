@@ -89,7 +89,7 @@ class LatentFactorModel(nn.Module):
             if n_users_final == 0 or n_items_final == 0:
                 raise ValueError(f"❌ Cannot initialize model with {n_users_final} users / {n_items_final} items.")
             
-            self.model = self.UEIEModel(n_users_final, n_items_final, self.k, self.mu).to(self.device)
+            self.model = self.ReviewRatingModel(n_users_final, n_items_final, self.k, self.mu).to(self.device)
 
             self.optimizer = optim.AdamW(self.model.parameters(), 
                                          lr=self.lr, 
@@ -97,7 +97,7 @@ class LatentFactorModel(nn.Module):
             print("✅ Initialization complete and ready for training.")
 
     class ReviewRatingModel(nn.Module):
-        def __init__(self, n_users, n_items, k, mu, P_init, Q_init, b_u_init, b_i_init):
+        def __init__(self, n_users, n_items, k, mu, P_init=None, Q_init=None, b_u_init=None, b_i_init=None):
             super().__init__()
             self.P = nn.Embedding(n_users, k)
             self.Q = nn.Embedding(n_items, k)
@@ -105,11 +105,17 @@ class LatentFactorModel(nn.Module):
             self.b_i = nn.Embedding(n_items, 1)
             self.mu = mu
             
-            with torch.no_grad():
-                self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
-                self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
-                self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
-                self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
+            if P_init is not None:
+                with torch.no_grad():
+                    self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
+                    self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
+                    self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
+                    self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
+            else:
+                nn.init.xavier_uniform_(self.P.weight)
+                nn.init.xavier_uniform_(self.Q.weight)
+                nn.init.zeros_(self.b_u.weight)
+                nn.init.zeros_(self.b_i.weight)
 
         def forward(self, user_idx, item_idx):
             p_u = self.P(user_idx)

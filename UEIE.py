@@ -374,6 +374,7 @@ class LatentFactorModel(nn.Module):
             raise
 
         for user_id, bias, factors in rows_users:
+            user_id = str(user_id)
             if user_id not in self.user2idx:
                 continue
             
@@ -719,28 +720,6 @@ class LatentFactorModel(nn.Module):
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")
             self.connection.rollback()
     
-    def debug_weights_to_db(self, user, item):
-        if self.model is None:
-            print("Model not initialized.")
-            return
-
-        u_idx_val = self.user2idx.get(user)
-        i_idx_val = self.item2idx.get(item)
-
-        if u_idx_val is not None:
-            p_vec = self.model.P.weight[u_idx_val].cpu().numpy()
-            b_u_val = self.model.b_u.weight[u_idx_val].item()
-            print(f"User {user} -> idx {u_idx_val}: b_u={b_u_val}, P={p_vec}")
-        else:
-            print(f"User {user} not in user2idx")
-
-        if i_idx_val is not None:
-            q_vec = self.model.Q.weight[i_idx_val].cpu().numpy()
-            b_i_val = self.model.b_i.weight[i_idx_val].item()
-            print(f"Item {item} -> idx {i_idx_val}: b_i={b_i_val}, Q={q_vec}")
-        else:
-            print(f"Item {item} not in item2idx")
-
     def predict(self, user, item, p):
         if self.model is None:
             return self.mu if self.mu else 3.0
@@ -752,7 +731,6 @@ class LatentFactorModel(nn.Module):
             
             if p == 1:
                 print(u_idx_val, i_idx_val)
-                self.debug_weights_to_db(user, item)
             if u_idx_val is None:
                 if i_idx_val is not None:
                     i_idx = torch.tensor([i_idx_val], device=self.device, dtype=torch.long)

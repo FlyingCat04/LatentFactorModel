@@ -805,7 +805,7 @@ if __name__ == "__main__":
 
         if model.model is not None:
             print("\n--- Starting Model Training ---")
-            model.train_model(epochs=10, batch_size=512)
+            model.train_model(epochs=500, batch_size=256)
         else:
             print("❌ Model initialization failed. Skipping training.")
 

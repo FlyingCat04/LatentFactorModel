@@ -504,68 +504,68 @@ if __name__ == "__main__":
     try:
         model = LatentFactorModel(
             connection=conn,
-            train_mode='load',
+            train_mode='train',
             model_id=4,
             k=90,
             lr=0.001,
             lam=0.01
         )
         
-        print(model.predict("b85cd4976dbbb72055cefbb984ebe941", "25074277", 1))
+        # print(model.predict("b85cd4976dbbb72055cefbb984ebe941", "25074277", 1))
         
-        # test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
-        # if not test_ratings_to_use:
-        #      print("⚠️ No test ratings loaded. Evaluation will be skipped.")
+        test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
+        if not test_ratings_to_use:
+             print("⚠️ No test ratings loaded. Evaluation will be skipped.")
 
-        # if model.model is not None:
-        #     print("\n--- Starting Model Training ---")
-        #     model.train_model(epochs=20, batch_size=512)
-        # else:
-        #     print("❌ Model initialization failed. Skipping training.")
+        if model.model is not None:
+            print("\n--- Starting Model Training ---")
+            model.train_model(epochs=500, batch_size=256)
+        else:
+            print("❌ Model initialization failed. Skipping training.")
 
-        # if model.model is not None:
-        #     print("\n--- Saving Model State ---")
-        #     model.write_model_to_db()
-        # else:
-        #     print("Skipping save.")
+        if model.model is not None:
+            print("\n--- Saving Model State ---")
+            model.write_model_to_db()
+        else:
+            print("Skipping save.")
         
-        # if test_ratings_to_use:
-        #     print("\n--- Evaluating Model ---")
+        if test_ratings_to_use:
+            print("\n--- Evaluating Model ---")
 
-        #     def compute_rmse(model_instance, ratings_set):
-        #         if not ratings_set: return float('nan')
-        #         squared_error = 0.0
-        #         count = 0
-        #         for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-        #             pred = 0.0
-        #             if count < 50:
-        #                 pred = model_instance.predict(user, item, 1)
-        #             else:
-        #                 pred = model_instance.predict(user, item, 0)
-        #             squared_error += (r_ui - pred) ** 2
-        #             if count < 50:
-        #                 print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
-        #                 count += 1
-        #         if not ratings_set: return 0.0
-        #         mse = squared_error / len(ratings_set)
-        #         rmse = np.sqrt(mse)
-        #         return rmse
+            def compute_rmse(model_instance, ratings_set):
+                if not ratings_set: return float('nan')
+                squared_error = 0.0
+                count = 0
+                for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
+                    pred = 0.0
+                    if count < 50:
+                        pred = model_instance.predict(user, item, 1)
+                    else:
+                        pred = model_instance.predict(user, item, 0)
+                    squared_error += (r_ui - pred) ** 2
+                    if count < 50:
+                        print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
+                        count += 1
+                if not ratings_set: return 0.0
+                mse = squared_error / len(ratings_set)
+                rmse = np.sqrt(mse)
+                return rmse
 
-        #     def compute_mae(model_instance, ratings_set):
-        #         if not ratings_set: return float('nan')
-        #         absolute_error = 0.0
-        #         for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
-        #             pred = model_instance.predict(user, item)
-        #             absolute_error += abs(r_ui - pred)
-        #         if not ratings_set: return 0.0
-        #         mae = absolute_error / len(ratings_set)
-        #         return mae
+            def compute_mae(model_instance, ratings_set):
+                if not ratings_set: return float('nan')
+                absolute_error = 0.0
+                for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
+                    pred = model_instance.predict(user, item)
+                    absolute_error += abs(r_ui - pred)
+                if not ratings_set: return 0.0
+                mae = absolute_error / len(ratings_set)
+                return mae
 
-        #     test_rmse = compute_rmse(model, test_ratings_to_use)
-        #     print(f"RMSE on test set: {test_rmse:.4f}")
+            test_rmse = compute_rmse(model, test_ratings_to_use)
+            print(f"RMSE on test set: {test_rmse:.4f}")
 
-        #     test_mae = compute_mae(model, test_ratings_to_use)
-        #     print(f"MAE on test set: {test_mae:.4f}")
+            test_mae = compute_mae(model, test_ratings_to_use)
+            print(f"MAE on test set: {test_mae:.4f}")
 
     except ValueError as ve: 
         print(f"\n❌ Initialization/Data Error: {ve}")

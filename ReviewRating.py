@@ -525,26 +525,6 @@ class LatentFactorModel(nn.Module):
         ).to(self.device)
         self.model.eval()
 
-        # with torch.no_grad():
-        #     loaded_params = 0
-        #     for user_id, bias in user_biases.items():
-        #         if user_id in self.user2idx:
-        #             self.model.b_u.weight[self.user2idx[user_id]] = bias
-        #             loaded_params +=1
-        #     for item_id, bias in item_biases.items():
-        #         if item_id in self.item2idx:
-        #             self.model.b_i.weight[self.item2idx[item_id]] = bias
-        #             loaded_params +=1
-        #     for user_id, factors in user_factors.items():
-        #          if user_id in self.user2idx:
-        #             if len(factors) == self.k:
-        #                 self.model.P.weight[self.user2idx[user_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
-        #                 loaded_params += self.k
-        #     for item_id, factors in item_factors.items():
-        #         if item_id in self.item2idx:
-        #             if len(factors) == self.k:
-        #                 self.model.Q.weight[self.item2idx[item_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
-        #                 loaded_params += self.k
         print(f"✅ Loaded Factors/Biases into PyTorch Model for Prediction.")
     
     def predict(self, user, item, p):

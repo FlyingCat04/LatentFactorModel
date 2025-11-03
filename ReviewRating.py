@@ -1,4 +1,3 @@
-import torch
 import time
 import numpy as np
 from google import genai
@@ -18,7 +17,7 @@ class LatentFactorModel(nn.Module):
         k=90,
         weight=0.3,
         lam=0.01,
-        lr=0.01,
+        lr=0.001,
         model_id=1,
         train_mode='train',
         device=None
@@ -151,9 +150,7 @@ class LatentFactorModel(nn.Module):
         
         self.items_list = [str(row[0]) for row in rows]
         
-        print(f"✅ Master indices loaded: {len(self.users)} users, {len(self.items_list)} items.")
-    
-    def load_or_convert_reviews(self, limit_total=1000000, ratio=0.8):
+    def load_or_convert_reviews(self, limit_total=1000000):
         cur = self.connection.cursor()
         try:
             cur.execute("""

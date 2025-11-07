@@ -452,8 +452,8 @@ class LatentFactorModel(nn.Module):
             u_idx_val = self.user2idx.get(user)
             i_idx_val = self.item2idx.get(item)
             
-            if p == 1:
-                print(u_idx_val, i_idx_val)
+            # if p == 1:
+            #     print(u_idx_val, i_idx_val)
             if u_idx_val is None:
                 if i_idx_val is not None:
                     i_idx = torch.tensor([i_idx_val], device=self.device, dtype=torch.long)

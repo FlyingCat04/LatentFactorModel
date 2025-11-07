@@ -184,8 +184,8 @@ class PLA(nn.Module):
 
     def forward(self, u, i):
         # ---- 1. Get phi(u, i) ----
-        Pu = self.review_model.model.P(torch.tensor([self.review_model.user2idx[u]], dtype=torch.long)).squeeze(0)     # shape [k]
-        Qi = self.review_model.model.Q(torch.tensor([self.review_model.item2idx[i]], dtype=torch.long)).squeeze(0)     # shape [k]
+        Pu = self.review_model.model.P(torch.tensor([self.review_model.user2idx[u]], dtype=torch.long, device=self.device)).squeeze(0)     # shape [k]
+        Qi = self.review_model.model.Q(torch.tensor([self.review_model.item2idx[i]], dtype=torch.long, device=self.device)).squeeze(0)     # shape [k]
         phi = torch.cat([Pu, Qi], dim=-1)   # shape [2k]
 
         # ---- 2. Get predictions from each submodel ----
@@ -200,7 +200,7 @@ class PLA(nn.Module):
         alphas = F.softmax(logits, dim=0)    # [S]
 
         # ---- 4. Weighted combination ----
-        r_hat = torch.sum(alphas * r_s) + self.bias  # final rating prediction
+        r_hat = torch.sum(alphas * r_s) + self.bias.to(self.device)  # final rating prediction
 
         # ---- 5. Return outputs ----
         return r_hat, alphas, r_s
@@ -261,14 +261,16 @@ class PLA(nn.Module):
             "reg": total_reg.item()
         }
     
-    def fit(self, n_epochs=10, batch_size=256):
+    def fit(self, n_epochs=10, batch_size=256, tol=1e-6):
         """
-        Train the PLA model for a number of epochs using mini-batch gradient descent.
+        Train the PLA model using mini-batch gradient descent with early stopping
+        if the change in total loss between epochs is less than `tol`.
         """
-        self.train()  # set model to training mode
+        self.train()
         n_samples = len(self.ratings)
-        n_batches = (n_samples + batch_size - 1) // batch_size  # ceiling division
+        n_batches = (n_samples + batch_size - 1) // batch_size
 
+        prev_loss = None
         print("🚀 Start training PLA model...")
         for epoch in range(1, n_epochs + 1):
             epoch_loss = 0.0
@@ -276,7 +278,7 @@ class PLA(nn.Module):
             epoch_pri = 0.0
             epoch_reg = 0.0
 
-            # # Shuffle data every epoch (optional but good practice)
+            # Optional: shuffle data for robustness
             # random.shuffle(self.ratings)
 
             for b in range(n_batches):
@@ -284,7 +286,6 @@ class PLA(nn.Module):
                 if not batch:
                     continue
 
-                # ---- Perform one train step ----
                 losses = self.train_step(batch)
                 epoch_loss += losses["loss"]
                 epoch_main += losses["main"]
@@ -299,11 +300,20 @@ class PLA(nn.Module):
 
             print(
                 f"Epoch {epoch:02d}/{n_epochs} | "
-                f"Loss: {epoch_loss:.4f} | "
-                f"Main: {epoch_main:.4f} | "
-                f"Priority: {epoch_pri:.4f} | "
-                f"Reg: {epoch_reg:.4f}"
+                f"Loss: {epoch_loss:.6f} | "
+                f"Main: {epoch_main:.6f} | "
+                f"Priority: {epoch_pri:.6f} | "
+                f"Reg: {epoch_reg:.6f}"
             )
+
+            # ---- Early stopping condition ----
+            if prev_loss is not None:
+                delta = abs(prev_loss - epoch_loss)
+                if delta < tol:
+                    print(f"🛑 Early stopping at epoch {epoch} (ΔLoss={delta:.2e} < {tol})")
+                    break
+
+            prev_loss = epoch_loss
 
         print("✅ Training finished! θ parameters are now learned.")
 
@@ -320,8 +330,8 @@ class PLA(nn.Module):
             #     item = torch.tensor([item], dtype=torch.long, device=self.device)
             # else:
             #     item = item.to(self.device)
-            if p == 1:
-                print(self.review_model.user2idx.get(user), self.review_model.item2idx.get(item))
+            # if p == 1:
+            #     print(self.review_model.user2idx.get(user), self.review_model.item2idx.get(item))
 
             # forward pass
             r_pred, _, _ = self.forward(user, item)  # [batch] shape
@@ -372,7 +382,7 @@ if __name__ == "__main__":
 
     DB_NAME = "rsystem"
     USER = "flyingcat2003"
-    HOST = "26.88.139.112"
+    HOST = "localhost"
     PASSWORD = "Hanly1912a"
 
     conn = None
@@ -395,61 +405,61 @@ if __name__ == "__main__":
             train_mode='train',
         )
         
-        print(model.predict("95b22f99934e50fa545d40099e3986e2", "12907847", 1))
+        # print(model.predict("95b22f99934e50fa545d40099e3986e2", "12907847", 1))
 
-        # test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
-        # if not test_ratings_to_use:
-        #      print("⚠️ No test ratings loaded. Evaluation will be skipped.")
+        test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
+        if not test_ratings_to_use:
+             print("⚠️ No test ratings loaded. Evaluation will be skipped.")
 
-        # if model is not None:
-        #     print("\n--- Starting Model Training ---")
-        #     model.fit()
-        # else:
-        #     print("❌ Model initialization failed. Skipping training.")
+        if model is not None:
+            print("\n--- Starting Model Training ---")
+            model.fit()
+        else:
+            print("❌ Model initialization failed. Skipping training.")
 
-        # if model is not None:
-        #     print("\n--- Saving Model State ---")
-        #     model.write_model_to_db()
-        # else:
-        #     print("Skipping save.")
+        if model is not None:
+            print("\n--- Saving Model State ---")
+            model.write_model_to_db()
+        else:
+            print("Skipping save.")
         
-        # if test_ratings_to_use:
-        #     print("\n--- Evaluating Model ---")
+        if test_ratings_to_use:
+            print("\n--- Evaluating Model ---")
 
-        #     def compute_rmse(model_instance, ratings_set):
-        #         if not ratings_set: return float('nan')
-        #         squared_error = 0.0
-        #         count = 0
-        #         for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-        #             pred = 0.0
-        #             if count < 50:
-        #                 pred = model_instance.predict(str(user), str(item), 1)
-        #             else:
-        #                 pred = model_instance.predict(str(user), str(item), 0)
-        #             squared_error += (r_ui - pred) ** 2
-        #             if count < 50:
-        #                 print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
-        #                 count += 1
-        #         if not ratings_set: return 0.0
-        #         mse = squared_error / len(ratings_set)
-        #         rmse = np.sqrt(mse)
-        #         return rmse
+            def compute_rmse(model_instance, ratings_set):
+                if not ratings_set: return float('nan')
+                squared_error = 0.0
+                count = 0
+                for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
+                    pred = 0.0
+                    if count < 50:
+                        pred = model_instance.predict(str(user), str(item), 1)
+                    else:
+                        pred = model_instance.predict(str(user), str(item), 0)
+                    squared_error += (r_ui - pred) ** 2
+                    if count < 50:
+                        print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
+                        count += 1
+                if not ratings_set: return 0.0
+                mse = squared_error / len(ratings_set)
+                rmse = np.sqrt(mse)
+                return rmse
 
-        #     # def compute_mae(model_instance, ratings_set):
-        #     #     if not ratings_set: return float('nan')
-        #     #     absolute_error = 0.0
-        #     #     for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
-        #     #         pred = model_instance.predict(user, item, 1)
-        #     #         absolute_error += abs(float(r_ui) - float(pred))
-        #     #     if not ratings_set: return 0.0
-        #     #     mae = absolute_error / len(ratings_set)
-        #     #     return mae
+            # def compute_mae(model_instance, ratings_set):
+            #     if not ratings_set: return float('nan')
+            #     absolute_error = 0.0
+            #     for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
+            #         pred = model_instance.predict(user, item, 1)
+            #         absolute_error += abs(float(r_ui) - float(pred))
+            #     if not ratings_set: return 0.0
+            #     mae = absolute_error / len(ratings_set)
+            #     return mae
 
-        #     test_rmse = compute_rmse(model, test_ratings_to_use)
-        #     print(f"RMSE on test set: {test_rmse:.4f}")
+            test_rmse = compute_rmse(model, test_ratings_to_use)
+            print(f"RMSE on test set: {test_rmse:.4f}")
 
-        #     # test_mae = compute_mae(model, test_ratings_to_use)
-        #     # print(f"MAE on test set: {test_mae:.4f}")
+            # test_mae = compute_mae(model, test_ratings_to_use)
+            # print(f"MAE on test set: {test_mae:.4f}")
         
     except ValueError as ve: 
         print(f"\n❌ Initialization/Data Error: {ve}")

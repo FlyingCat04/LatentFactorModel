@@ -335,12 +335,32 @@ class PLA(nn.Module):
 
             # forward pass
             r_pred, _, _ = self.forward(user, item)  # [batch] shape
+            self.write_predictions_to_db(user, item, r_pred.item())
 
             # if input is a single (user, item), return scalar
             if r_pred.numel() == 1:
                 return r_pred.item()
             else:
                 return r_pred
+            
+    def write_predictions_to_db(self, user, item, value, table_name="Predict"):
+        if self.connection is None:
+            raise ValueError("❌ DB connection required.")
+
+        cur = self.connection.cursor()
+        try:
+            cur.execute(f"""
+                INSERT INTO "{table_name}" ("UserID", "ItemID", "Value")
+                VALUES (%s, %s, %s)
+                ON CONFLICT ("UserID", "ItemID") DO NOTHING;
+            """, (user, item, value))
+            self.connection.commit()
+            print(f"✅ Prediction written.")
+        except Exception as e:
+            print(f"❌ Error writing prediction to DB: {e}")
+            self.connection.rollback()
+        finally:
+            cur.close()
 
     def write_model_to_db(self):
         if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
@@ -382,7 +402,7 @@ if __name__ == "__main__":
 
     DB_NAME = "rsystem"
     USER = "flyingcat2003"
-    HOST = "localhost"
+    HOST = "26.88.139.112"
     PASSWORD = "Hanly1912a"
 
     conn = None
@@ -402,7 +422,7 @@ if __name__ == "__main__":
     try:
         model = PLA(
             connection=conn,
-            train_mode='train',
+            train_mode='load',
         )
         
         # print(model.predict("95b22f99934e50fa545d40099e3986e2", "12907847", 1))

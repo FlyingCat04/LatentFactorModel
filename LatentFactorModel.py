@@ -6,7 +6,6 @@ from collections import defaultdict
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 import psycopg2
-from typing import List, Tuple, Union
 
 class LatentFactorModel:
     def __init__(self, ratings, item_texts, connection=None):
@@ -435,36 +434,5 @@ if __name__ == "__main__":
     #     if count == 10:
     #         break
     # print(item_texts)
-
-    def save_predictions_to_db(
-        cur,
-        predictions: List[Tuple[int, int, float]],
-        table_name: str = "Predict"
-    ) -> int:
-        if not predictions:
-            print("⚠️ Không có dữ liệu dự đoán để lưu.")
-            return 0
-        
-        # SQL UPSERT statement: Chèn, nếu đã tồn tại (dựa trên PK/Unique Index), thì cập nhật Value.
-        sql_upsert = f"""
-            INSERT INTO goodreads."{table_name}" ("UserID", "ItemID", "Value")
-            VALUES (%s, %s, %s)
-            ON CONFLICT ("UserID", "ItemID") DO UPDATE SET
-                "Value" = EXCLUDED."Value";
-        """
-        try:
-            # Sử dụng execute_batch để chèn hàng loạt, nhanh hơn nhiều so với vòng lặp execute
-            psycopg2.extras.execute_batch(cur, sql_upsert, predictions)
-            
-            row_count = cur.rowcount
-            cur.commit()
-            
-            print(f"✅ Đã lưu/cập nhật thành công {row_count} dự đoán vào bảng '{table_name}'.")
-            return row_count
-            
-        except Exception as e:
-            print(f"❌ Lỗi khi lưu dự đoán vào DB: {e}")
-            cur.rollback()  
-            raise
     
     conn.close()

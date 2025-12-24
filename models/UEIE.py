@@ -21,6 +21,7 @@ class LatentFactorModel(nn.Module):
         lam=0.001,
         lr=0.01,
         model_id=1,
+        domain_id=None,
         train_mode='train',
         device=None
     ):
@@ -48,6 +49,7 @@ class LatentFactorModel(nn.Module):
         self.model = None
         self.optimizer = None
         self.inferred_prefs = None
+        self.domain_id = domain_id
 
         if self.connection is None and self.train_mode == 'train' and (ratings is None or items is None):
             raise ValueError("❌ DB connection or ratings/items required for training.")
@@ -70,9 +72,10 @@ class LatentFactorModel(nn.Module):
                 raise ValueError("❌ Parameter 'k' (e.g., 90) is required for training.")
 
             if ratings is None:
-                self.load_ratings_from_db()
+                self.load_ratings_from_db(ratio=1)
             else:
-                self.ratings, self.test_ratings = train_test_split(ratings, test_size=0.2, random_state=42)
+                # self.ratings, self.test_ratings = train_test_split(ratings, test_size=0.2, random_state=42)
+                self.ratings, self.test_ratings = ratings, []
 
             if not self.ratings:
                 raise ValueError("❌ No training ratings available.")
@@ -181,10 +184,11 @@ class LatentFactorModel(nn.Module):
         cur = self.connection.cursor()
         try:
             cur.execute("""
-                SELECT "UserID"
+                SELECT "Id"
                 From "User"
-                ORDER BY "UserID"
-            """, ())
+                WHERE "DomainId" = %s
+                ORDER BY "Id"
+            """, (self.domain_id,))
             rows = cur.fetchall()
         except Exception as e:
             raise
@@ -193,10 +197,11 @@ class LatentFactorModel(nn.Module):
         
         try:
             cur.execute("""
-                SELECT "ItemID"
+                SELECT "Id"
                 From "Item"
-                ORDER BY "ItemID"
-            """, ())
+                WHERE "DomainId" = %s
+                ORDER BY "Id"
+            """, (self.domain_id,))
             rows = cur.fetchall()
         except Exception as e:
             raise
@@ -207,11 +212,11 @@ class LatentFactorModel(nn.Module):
         cur = self.connection.cursor()
         try:
             cur.execute("""
-                SELECT "UserID", "ItemID", "RatingValue"
+                SELECT "UserId", "ItemId", "Value"
                 FROM "Rating"
-                ORDER BY RANDOM()
+                WHERE "DomainId" = %s
                 LIMIT %s
-            """, (limit_total,))
+            """, (self.domain_id, limit_total))
             rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
@@ -246,10 +251,10 @@ class LatentFactorModel(nn.Module):
             if not chunk: continue
             try:
                 cur.execute("""
-                    SELECT "ItemID", "Description", "ItemEmbeddingVector"
+                    SELECT "Id", "Description", "EmbeddingVector"
                     FROM "Item"
-                    WHERE "ItemID" = ANY(%s::int[])
-                """, (chunk,))
+                    WHERE "DomainId" = %s AND "Id" = ANY(%s::int[])
+                """, (self.domain_id, chunk,))
                 rows_chunk = cur.fetchall()
                 all_rows_items.extend(rows_chunk)
             except Exception as e:
@@ -299,10 +304,10 @@ class LatentFactorModel(nn.Module):
             if not chunk: continue
             try:
                 cur.execute("""
-                    SELECT "UserID", "UserEmbeddingVector"
+                    SELECT "Id", "UserEmbeddingVector"
                     FROM "User"
-                    WHERE "UserID" = ANY(%s)
-                """, (chunk,))
+                    WHERE "DomainId" = %s AND "Id" = ANY(%s::int[])
+                """, (self.domain_id, chunk,))
                 rows_chunk = cur.fetchall()
                 all_rows_users.extend(rows_chunk)
             except Exception as e:
@@ -342,10 +347,10 @@ class LatentFactorModel(nn.Module):
 
         try:
             cur.execute("""
-                SELECT "ItemID", "ItemBias", "ItemFactors"
+                SELECT "ItemId", "ItemBias", "ItemFactors"
                 FROM "ItemFactor"
-                WHERE "ModelID" = %s
-                ORDER BY "ItemID"
+                WHERE "ModelId" = %s
+                ORDER BY "ItemId"
             """, (model_id,))
             rows_items = cur.fetchall()
         except Exception as e:
@@ -371,10 +376,10 @@ class LatentFactorModel(nn.Module):
         user_biases = {}
         try:
             cur.execute("""
-                SELECT "UserID", "UserBias", "UserFactors"
+                SELECT "UserId", "UserBias", "UserFactors"
                 FROM "UserFactor"
-                WHERE "ModelID" = %s
-                ORDER BY "UserID"
+                WHERE "ModelId" = %s
+                ORDER BY "UserId"
             """, (model_id,))
             rows_users = cur.fetchall()
         except Exception as e:
@@ -399,7 +404,7 @@ class LatentFactorModel(nn.Module):
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
-        cur.execute('SELECT "AverageRating" FROM "Model" WHERE "ModelID"=%s', (model_id,))
+        cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
         mu_row = cur.fetchone()
         self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3
 
@@ -611,7 +616,7 @@ class LatentFactorModel(nn.Module):
             final_reg_loss = 0.5 * self.lam * (reg_p + reg_q + reg_bu + reg_bi).item()
             avg_total_loss_to_track = avg_main_loss + final_reg_loss / n
             
-            print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f}")
+            # print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f}")
 
             if abs(prev_avg_loss - avg_total_loss_to_track) < tolerance:
                 print(f"✅ Early stopping at epoch {epoch+1} (|Δloss|={abs(prev_avg_loss - avg_total_loss_to_track):.6e} < {tolerance})")
@@ -633,12 +638,12 @@ class LatentFactorModel(nn.Module):
             for user_id in self.users:
                 if user_id in self.user_emb_dict:
                     emb = self.user_emb_dict[user_id]
-                    cur.execute('UPDATE "User" SET "UserEmbeddingVector"=%s, "modified_at"=NOW() WHERE "UserID"=%s', (emb.tolist(), user_id))
+                    cur.execute('UPDATE "User" SET "UserEmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), user_id))
                     update_count_u += cur.rowcount
             for item_id in self.items_list:
                 if item_id in self.item_emb_dict:
                     emb = self.item_emb_dict[item_id]
-                    cur.execute('UPDATE "Item" SET "ItemEmbeddingVector"=%s, "modified_at"=NOW() WHERE "ItemID"=%s', (emb.tolist(), item_id))
+                    cur.execute('UPDATE "Item" SET "EmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), item_id))
                     update_count_i += cur.rowcount
             print(f"Updated embeddings for {update_count_u} users, {update_count_i} items.")
             self.connection.commit()
@@ -696,9 +701,9 @@ class LatentFactorModel(nn.Module):
 
             if user_factor_data:
                 sql_user = """
-                INSERT INTO "UserFactor" ("UserID", "UserBias", "UserFactors", "ModelID")
+                INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("UserID", "ModelID") DO UPDATE SET 
+                ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
                     "UserBias" = EXCLUDED."UserBias",
                     "UserFactors" = EXCLUDED."UserFactors";
                 """
@@ -706,9 +711,9 @@ class LatentFactorModel(nn.Module):
 
             if item_factor_data:
                 sql_item = """
-                INSERT INTO "ItemFactor" ("ItemID", "ItemBias", "ItemFactors", "ModelID")
+                INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("ItemID", "ModelID") DO UPDATE SET
+                ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
                     "ItemBias" = EXCLUDED."ItemBias",
                     "ItemFactors" = EXCLUDED."ItemFactors";
                 """
@@ -716,7 +721,7 @@ class LatentFactorModel(nn.Module):
             
             cur = self.connection.cursor()
             cur.execute("""
-                UPDATE "Model" SET "AverageRating"=%s, "modified_at"=NOW() WHERE "ModelID"=%s 
+                UPDATE "Model" SET "AverageRating"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s 
             """, (float(self.mu), self.model_id))
             
             self.connection.commit()
@@ -759,108 +764,3 @@ class LatentFactorModel(nn.Module):
             prediction = self.model(u_idx, i_idx).item()
             
             return np.clip(prediction, 1.0, 5.0)
-
-if __name__ == "__main__":
-    np.random.seed(42)
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-    DB_NAME = "rsystem"
-    USER = "flyingcat2003"
-    HOST = "localhost"
-    PASSWORD = "Hanly1912a"
-
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME, 
-            user=USER, 
-            host=HOST, 
-            password=PASSWORD,
-            options="-c search_path=dbo,goodreads"
-            )
-        import psycopg2.extras
-        print("✅ Database connected successfully.")
-    except Exception as e:
-        print(f"❌ DB Connection Error: {e}")
-        exit()
-
-    try:
-        model = LatentFactorModel(
-            connection=conn,
-            train_mode='train',
-            model_id=1,
-            k=90,
-            lr=0.001,
-            lam=0.01,
-            weight=0.3
-        )
-        
-        # print(model.predict("cce9b2a37665aa5aa978d2dc622066ba", "7824768", 1))
-        
-        test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
-        if not test_ratings_to_use:
-            print("⚠️ No test ratings loaded. Evaluation will be skipped.")
-
-        if model.model is not None:
-            print("\n--- Starting Model Training ---")
-            model.train_model(epochs=500, batch_size=256)
-        else:
-            print("❌ Model initialization failed. Skipping training.")
-
-        if model.model is not None:
-            print("\n--- Saving Model State ---")
-            model.write_model_to_db()
-        else:
-            print("Skipping save.")
-        
-        if test_ratings_to_use:
-            print("\n--- Evaluating Model ---")
-
-            def compute_rmse(model_instance, ratings_set):
-                if not ratings_set: return float('nan')
-                squared_error = 0.0
-                count = 0
-                for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-                    pred = 0.0
-                    if count < 50:
-                        pred = model_instance.predict(user, item, 1)
-                    else:
-                        pred = model_instance.predict(user, item, 0)
-                    squared_error += (r_ui - pred) ** 2
-                    if count < 50:
-                        print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
-                        count += 1
-                if not ratings_set: return 0.0
-                mse = squared_error / len(ratings_set)
-                rmse = np.sqrt(mse)
-                return rmse
-
-            def compute_mae(model_instance, ratings_set):
-                if not ratings_set: return float('nan')
-                absolute_error = 0.0
-                for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
-                    pred = model_instance.predict(user, item)
-                    absolute_error += abs(r_ui - pred)
-                if not ratings_set: return 0.0
-                mae = absolute_error / len(ratings_set)
-                return mae
-
-            test_rmse = compute_rmse(model, test_ratings_to_use)
-            print(f"RMSE on test set: {test_rmse:.4f}")
-
-            test_mae = compute_mae(model, test_ratings_to_use)
-            print(f"MAE on test set: {test_mae:.4f}")
-
-    except ValueError as ve: 
-        print(f"\n❌ Initialization/Data Error: {ve}")
-    except Exception as e: 
-        print(f"\n❌ An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-
-    finally:
-        if conn is not None:
-            conn.close()
-            print("\nDatabase connection closed.")

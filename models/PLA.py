@@ -6,10 +6,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ReviewRating import LatentFactorModel as ReviewModel
-from UCInit import LatentFactorModel as UCInitModel
-from UEIE import LatentFactorModel as UEIEModel
-from IInit import LatentFactorModel as IInitModel
+try:
+    from .ReviewRating import LatentFactorModel as ReviewModel
+    from .UCInit import LatentFactorModel as UCInitModel
+    from .UEIE import LatentFactorModel as UEIEModel
+    from .IInit import LatentFactorModel as IInitModel
+except ImportError:
+    from ReviewRating import LatentFactorModel as ReviewModel
+    from UCInit import LatentFactorModel as UCInitModel
+    from UEIE import LatentFactorModel as UEIEModel
+    from IInit import LatentFactorModel as IInitModel
 
 class PLA(nn.Module):
     def __init__(
@@ -19,6 +25,8 @@ class PLA(nn.Module):
         # users = None,
         # items=None,
         connection=None, 
+        domain_id=None,       
+        model_ids_map=None,
         k=90,
         lambda_reg=0.01,
         lambda_pri=0.01,
@@ -32,6 +40,7 @@ class PLA(nn.Module):
         print(f"Using device: {self.device}")
 
         self.connection = connection
+        self.domain_id = domain_id
         self.ratings = None
         self.test_ratings = None
         self.theta = None
@@ -44,39 +53,51 @@ class PLA(nn.Module):
         self.lambda_reg = lambda_reg
         self.lambda_pri = lambda_pri
         self.lr = lr
-        self.model_id = model_id
+        self.model_id = model_ids_map.get("PLA")
         self.train_mode = train_mode.lower()
+        self.model_ids_map = model_ids_map
+        
+        if self.connection is None:
+            raise ValueError("❌ DB connection required.")
+        if self.domain_id is None:
+            raise ValueError("❌ 'domain_id' is required.")
+        if model_ids_map is None:
+            raise ValueError("❌ 'model_ids_map' is required.")
 
         self.review_model = ReviewModel(
-            connection=conn,
+            connection=self.connection,
             train_mode='load',
-            model_id=3,
+            model_id=model_ids_map["ReviewRating"],
+            domain_id=self.domain_id,
             k=90,
             lr=0.001,
             lam=0.01,
             weight=0.3
         )
         self.ueie_model = UEIEModel(
-            connection=conn,
+            connection=self.connection,
             train_mode='load',
-            model_id=1,
+            model_id=model_ids_map["UEIE"],
+            domain_id=self.domain_id,
             k=90,
             lr=0.001,
             lam=0.01,
             weight=0.3
         )
         self.ucinit_model = UCInitModel(
-            connection=conn,
+            connection=self.connection,
             train_mode='load',
-            model_id=2,
+            model_id=model_ids_map["UCInit"],
+            domain_id=self.domain_id,
             k=90,
             lr=0.001,
             lam=0.01
         )
         self.iinit_model = IInitModel(
-            connection=conn,
+            connection=self.connection,
             train_mode='load',
-            model_id=4,
+            model_id=model_ids_map["IInit"],
+            domain_id=self.domain_id,
             k=90,
             lr=0.001,
             lam=0.01
@@ -126,44 +147,85 @@ class PLA(nn.Module):
         # else:
         #     pass
 
+    # def load_theta_from_db(self):
+    #     cursor = self.connection.cursor()
+
+    #     # Define correct order: ReviewRating(3), UEIE(1), UCInit(2), IInit(4)
+    #     model_order = [self.model_ids_map["ReviewRating"], self.model_ids_map["UEIE"], self.model_ids_map["UCInit"], self.model_ids_map["IInit"]]
+    #     thetas = []
+    #     for mid in model_order:
+    #         cursor.execute("""
+    #             SELECT "LearnableParameters" FROM "Model" WHERE "Id" = %s;
+    #         """,
+    #             (mid,)
+    #         )
+    #         result = cursor.fetchone()
+    #         if result is None:
+    #             raise ValueError(f"❌ No LearnableParameters found for ModelID={mid}")
+
+    #         # PostgreSQL REAL[] → Python list → NumPy array → torch tensor
+    #         arr = np.array(result[0], dtype=np.float32)
+    #         thetas.append(arr)
+
+    #     # Stack to shape [num_models, 2*k]
+    #     theta_matrix = np.stack(thetas, axis=0)
+    #     theta_tensor = torch.tensor(theta_matrix, dtype=torch.float32, device=self.device)
+
+    #     # Assign as nn.Parameter
+    #     self.theta = nn.Parameter(theta_tensor)
+
+    #     print(f"✅ Loaded theta from DB, shape: {self.theta.shape}")
+        
     def load_theta_from_db(self):
+        """
+        Load tham số từ DB. Nếu gặp NULL hoặc sai kích thước -> Tự động Init Random.
+        """
         cursor = self.connection.cursor()
-
-        # Define correct order: ReviewRating(3), UEIE(1), UCInit(2), IInit(4)
-        model_order = [3, 1, 2, 4]
+        
+        model_order_names = ["ReviewRating", "UEIE", "UCInit", "IInit"]
         thetas = []
-        for mid in model_order:
-            cursor.execute("""
-                SELECT "LearnableParameter" FROM "Model" WHERE "ModelID" = %s;
-            """,
-                (mid,)
-            )
-            result = cursor.fetchone()
-            if result is None:
-                raise ValueError(f"❌ No LearnableParameter found for ModelID={mid}")
+        expected_dim = 2 * self.k
 
-            # PostgreSQL REAL[] → Python list → NumPy array → torch tensor
-            arr = np.array(result[0], dtype=np.float32)
+        print("--- Loading Theta from DB ---")
+        for name in model_order_names:
+            mid = self.model_ids_map[name]
+            cursor.execute('SELECT "LearnableParameters" FROM "Model" WHERE "Id" = %s', (mid,))
+            result = cursor.fetchone()
+            
+            arr = np.random.randn(expected_dim).astype(np.float32) * 0.1
+            status = "🆕 NULL/Empty -> Random Init"
+
+            if result and result[0] is not None:
+                try:
+                    db_arr = np.array(result[0], dtype=np.float32)
+                    
+                    if db_arr.size == expected_dim:
+                        arr = db_arr
+                        status = "✅ Loaded"
+                    else:
+                        status = f"⚠️ Size Mismatch ({db_arr.size} vs {expected_dim}) -> Re-init"
+                except Exception:
+                    status = "❌ Parse Error -> Re-init"
+            
+            print(f"   - {name} (ID {mid}): {status}")
             thetas.append(arr)
 
-        # Stack to shape [num_models, 2*k]
         theta_matrix = np.stack(thetas, axis=0)
-        theta_tensor = torch.tensor(theta_matrix, dtype=torch.float32, device=self.device)
-
-        # Assign as nn.Parameter
-        self.theta = nn.Parameter(theta_tensor)
-
-        print(f"✅ Loaded theta from DB, shape: {self.theta.shape}")
+        
+        self.theta = nn.Parameter(torch.tensor(theta_matrix, dtype=torch.float32, device=self.device))
+        
+        if self.theta.shape != torch.Size([4, expected_dim]):
+            raise RuntimeError(f"❌ Theta Shape Error: Got {self.theta.shape}, Expected [4, {expected_dim}]")
 
     def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
         cur = self.connection.cursor()
         try:
             cur.execute("""
-                SELECT "UserID", "ItemID", "RatingValue"
+                SELECT "UserId", "ItemId", "Value"
                 FROM "Rating"
-                ORDER BY RANDOM()
+                WHERE "DomainId" = %s
                 LIMIT %s
-            """, (limit_total,))
+            """, (self.domain_id, limit_total))
             rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
@@ -261,7 +323,7 @@ class PLA(nn.Module):
             "reg": total_reg.item()
         }
     
-    def fit(self, n_epochs=10, batch_size=256, tol=1e-6):
+    def fit(self, n_epochs=500, batch_size=256, tol=1e-6):
         """
         Train the PLA model using mini-batch gradient descent with early stopping
         if the change in total loss between epochs is less than `tol`.
@@ -350,9 +412,9 @@ class PLA(nn.Module):
         cur = self.connection.cursor()
         try:
             cur.execute(f"""
-                INSERT INTO "{table_name}" ("UserID", "ItemID", "Value")
+                INSERT INTO "{table_name}" ("UserId", "ItemId", "Value")
                 VALUES (%s, %s, %s)
-                ON CONFLICT ("UserID", "ItemID") DO NOTHING;
+                ON CONFLICT ("UserId", "ItemId") DO NOTHING;
             """, (user, item, value))
             self.connection.commit()
             print(f"✅ Prediction written.")
@@ -362,227 +424,59 @@ class PLA(nn.Module):
         finally:
             cur.close()
 
-    def write_model_to_db(self):
-        if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
-        if self.connection is None: raise ValueError("❌ DB connection required.")
+    # def write_model_to_db(self):
+    #     if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
+    #     if self.connection is None: raise ValueError("❌ DB connection required.")
 
+    #     cur = self.connection.cursor()
+    #     self.eval()
+
+    #     # Ensure parameters are on CPU and converted to numpy
+    #     theta_values = self.theta.detach().cpu().numpy()  # shape [num_models, 2*k]
+    #     # model_names = ["UEIE", "UCInit", "ReviewRating", "IInit"]
+    #     # model_names = ["ReviewRating", "UEIE", "UCInit", "IInit"]
+    #     model_ids = [3, 1, 2, 4]
+
+    #     # Prepare data tuples for batch insert
+    #     data_to_insert = []
+    #     for _, (id, theta_row) in enumerate(zip(model_ids, theta_values)):
+    #         theta_list = theta_row.tolist()  # convert to Python list (for REAL[])
+    #         data_to_insert.append((theta_list, id))
+
+    #     # Execute batch insert/update
+    #     cur = self.connection.cursor()
+    #     query = """
+    #         UPDATE "Model" SET "LearnableParameters" = %s
+    #         WHERE "Id" = %s;
+    #     """
+
+    #     psycopg2.extras.execute_batch(cur, query, data_to_insert)
+    #     self.connection.commit()
+    #     cur.close()
+
+    #     print(f"[INFO] Saved {len(data_to_insert)} theta vectors to 'Model' table.")
+        
+    def write_model_to_db(self):
+        if self.connection is None: return
         cur = self.connection.cursor()
         self.eval()
 
-        # Ensure parameters are on CPU and converted to numpy
-        theta_values = self.theta.detach().cpu().numpy()  # shape [num_models, 2*k]
-        # model_names = ["UEIE", "UCInit", "ReviewRating", "IInit"]
-        # model_names = ["ReviewRating", "UEIE", "UCInit", "IInit"]
-        model_ids = [3, 1, 2, 4]
-
-        # Prepare data tuples for batch insert
+        theta_values = self.theta.detach().cpu().numpy() # Shape [4, 180]
+        model_order_names = ["ReviewRating", "UEIE", "UCInit", "IInit"]
         data_to_insert = []
-        for _, (id, theta_row) in enumerate(zip(model_ids, theta_values)):
-            theta_list = theta_row.tolist()  # convert to Python list (for REAL[])
-            data_to_insert.append((theta_list, id))
-
-        # Execute batch insert/update
-        cur = self.connection.cursor()
-        query = """
-            UPDATE "Model" SET "LearnableParameter" = %s
-            WHERE "ModelID" = %s;
-        """
-
-        psycopg2.extras.execute_batch(cur, query, data_to_insert)
-        self.connection.commit()
-        cur.close()
-
-        print(f"[INFO] Saved {len(data_to_insert)} theta vectors to 'Model' table.")
-
-if __name__ == "__main__":
-    np.random.seed(42)
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-    DB_NAME = "rsystem"
-    USER = "flyingcat2003"
-    HOST = "26.88.139.112"
-    PASSWORD = "Hanly1912a"
-
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME, 
-            user=USER, 
-            host=HOST, 
-            password=PASSWORD,
-            options="-c search_path=dbo,goodreads"
-        )
-        print("✅ Database connected successfully.")
-    except Exception as e:
-        print(f"❌ DB Connection Error: {e}")
-        exit()
-
-    try:
-        model = PLA(
-            connection=conn,
-            train_mode='load',
-        )
         
-        # print(model.predict("95b22f99934e50fa545d40099e3986e2", "12907847", 1))
+        for idx, name in enumerate(model_order_names):
+            mid = self.model_ids_map[name]
+            theta_list = theta_values[idx].tolist()
+            data_to_insert.append((theta_list, mid))
 
-        test_ratings_to_use = model.test_ratings if model.test_ratings is not None else []
-        if not test_ratings_to_use:
-             print("⚠️ No test ratings loaded. Evaluation will be skipped.")
-
-        if model is not None:
-            print("\n--- Starting Model Training ---")
-            model.fit()
-        else:
-            print("❌ Model initialization failed. Skipping training.")
-
-        if model is not None:
-            print("\n--- Saving Model State ---")
-            model.write_model_to_db()
-        else:
-            print("Skipping save.")
-        
-        if test_ratings_to_use:
-            print("\n--- Evaluating Model ---")
-
-            def compute_rmse(model_instance, ratings_set):
-                if not ratings_set: return float('nan')
-                squared_error = 0.0
-                count = 0
-                for user, item, r_ui in tqdm(ratings_set, desc="RMSE Eval"):
-                    pred = 0.0
-                    if count < 50:
-                        pred = model_instance.predict(str(user), str(item), 1)
-                    else:
-                        pred = model_instance.predict(str(user), str(item), 0)
-                    squared_error += (r_ui - pred) ** 2
-                    if count < 50:
-                        print(f"   {user}-{item}: true={r_ui}, pred={pred:.2f}")
-                        count += 1
-                if not ratings_set: return 0.0
-                mse = squared_error / len(ratings_set)
-                rmse = np.sqrt(mse)
-                return rmse
-
-            # def compute_mae(model_instance, ratings_set):
-            #     if not ratings_set: return float('nan')
-            #     absolute_error = 0.0
-            #     for user, item, r_ui in tqdm(ratings_set, desc="MAE Eval"):
-            #         pred = model_instance.predict(user, item, 1)
-            #         absolute_error += abs(float(r_ui) - float(pred))
-            #     if not ratings_set: return 0.0
-            #     mae = absolute_error / len(ratings_set)
-            #     return mae
-
-            test_rmse = compute_rmse(model, test_ratings_to_use)
-            print(f"RMSE on test set: {test_rmse:.4f}")
-
-            # test_mae = compute_mae(model, test_ratings_to_use)
-            # print(f"MAE on test set: {test_mae:.4f}")
-        
-    except ValueError as ve: 
-        print(f"\n❌ Initialization/Data Error: {ve}")
-    except Exception as e: 
-        print(f"\n❌ An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-
-    finally:
-        if conn is not None:
-            conn.close()
-            print("\nDatabase connection closed.")
-
-
-
-
-
-
-
-
-
-
-
-
-        # x, y = "95b22f99934e50fa545d40099e3986e2", "12907847"
-        # print(model.review_model.predict(x, y, 1))
-        # print(1)
-
-        # u = torch.tensor([model.review_model.user2idx[x]], dtype=torch.long)
-        # i = torch.tensor([model.review_model.item2idx[y]], dtype=torch.long)
-        # print(2)
-
-        # Pu = model.review_model.model.P(u).squeeze(0)   # shape [k]
-        # Qi = model.review_model.model.Q(i).squeeze(0)   # shape [k]
-        # print(3)
-
-        # phi = torch.cat([Pu, Qi], dim=-1)   # shape [2k]
-        # print(4)
-
-        # print(len(Pu), Pu)
-        # print(Qi)
-        # print(phi)
-
-
-
-    # def fit(self, train_data, n_epochs=10, batch_size=128):
-    #     for epoch in range(n_epochs):
-    #         random.shuffle(train_data)
-    #         batches = [
-    #             train_data[i:i + batch_size]
-    #             for i in range(0, len(train_data), batch_size)
-    #         ]
-    #         epoch_loss = 0.0
-    #         for batch in batches:
-    #             logs = self.train_step(batch)
-    #             epoch_loss += logs["loss"]
-    #         print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / len(batches):.4f}")
-
-
-
-# class PLA(nn.Module):
-#     def __init__(self, dim, m, lambda_pri=0.5, lambda_reg=0.01):
-#         super().__init__()
-#         self.m = m
-#         self.theta = nn.ParameterList([nn.Parameter(torch.randn(dim)) for _ in range(m)])
-#         self.lambda_pri = lambda_pri
-#         self.lambda_reg = lambda_reg
-
-#     def forward(self, phi, sub_preds):
-#         # Compute unnormalized scores
-#         alpha_tilde = torch.stack([phi @ theta for theta in self.theta])  # shape (m,)
-#         # Softmax normalization
-#         alpha = F.softmax(alpha_tilde, dim=0)
-#         # Aggregate prediction
-#         r_hat = torch.sum(alpha * sub_preds)
-#         return r_hat, alpha
-
-#     def loss(self, r_true, r_hat, alpha):
-#         L_main = 0.5 * (r_true - r_hat)**2
-#         # Priority constraint loss
-#         L_pri = 0.5 * torch.sum(F.relu(alpha[1:] - alpha[0])**2)
-#         # Regularization loss
-#         L_reg = 0.5 * sum(torch.sum(theta**2) for theta in self.theta)
-#         # Total loss
-#         return L_main + self.lambda_pri * L_pri + self.lambda_reg * L_reg
-
-# model = PLA(dim=6, m=3)
-# optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-
-# # Example data
-# phi = torch.tensor([0.6, -0.2, 0.9, 0.4, 0.7, -0.1])
-# sub_preds = torch.tensor([4.0, 3.8, 4.2])
-# r_true = torch.tensor(4.5)
-
-# # Forward
-# r_hat, alpha = model(phi, sub_preds)
-# loss = model.loss(r_true, r_hat, alpha)
-
-# # Backward and update
-# optimizer.zero_grad()
-# loss.backward()
-# optimizer.step()
-
-# print("Pred:", r_hat.item(), "Loss:", loss.item())
-# for i, t in enumerate(model.theta):
-#     print(f"Theta_{i+1}:", t.data)
+        try:
+            query = 'UPDATE "Model" SET "LearnableParameters" = %s, "ModifiedAt" = NOW() WHERE "Id" = %s;'
+            psycopg2.extras.execute_batch(cur, query, data_to_insert)
+            self.connection.commit()
+            print(f"💾 Saved {len(data_to_insert)} theta vectors to DB (replaced NULLs).")
+        except Exception as e:
+            print(f"❌ Error saving model: {e}")
+            self.connection.rollback()
+        finally:
+            cur.close()

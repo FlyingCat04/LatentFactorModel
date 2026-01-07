@@ -123,7 +123,7 @@ def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, trai
         traceback.print_exc()
         db_conn.rollback()
 
-@app.post("/api/train")
+@app.post("/api/train", status_code=202)
 def trigger_training(req: TrainRequest, background_tasks: BackgroundTasks):
     if not db_conn:
         raise HTTPException(status_code=503, detail="Database chưa kết nối.")

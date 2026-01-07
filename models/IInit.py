@@ -65,6 +65,14 @@ class LatentFactorModel(nn.Module):
             self.load_user_item_from_db()
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: idx for idx, i in enumerate(self.items_list)}
+            
+            # Filter ratings to only include valid users and items
+            original_count = len(self.ratings)
+            self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
+            filtered_count = original_count - len(self.ratings)
+            if filtered_count > 0:
+                print(f"⚠️ Filtered out {filtered_count} ratings with invalid user/item IDs")
+            
             # self.ratings, self.test_ratings = train_test_split(self.ratings, test_size=0, random_state=42)
             self.ratings, self.test_ratings = self.ratings, []
 
@@ -242,7 +250,7 @@ class LatentFactorModel(nn.Module):
             cur.execute("""
                 SELECT "UserId", "ItemId", "Value"
                 FROM "Rating"
-                WHERE "DomainId" = %s
+                WHERE "DomainId" = %s AND "Value" IS NOT NULL
                 LIMIT %s
             """, (self.domain_id, limit_total))
             rows = cur.fetchall()
@@ -280,9 +288,12 @@ class LatentFactorModel(nn.Module):
         )
         rows = cur.fetchall()
         for u, i in rows:
-            user_idx = self.user2idx[str(u)]
-            item_idx = self.item2idx[str(i)]
-            interaction_matrix[user_idx, item_idx] = 1
+            u_str = str(u)
+            i_str = str(i)
+            if u_str in self.user2idx and i_str in self.item2idx:
+                user_idx = self.user2idx[u_str]
+                item_idx = self.item2idx[i_str]
+                interaction_matrix[user_idx, item_idx] = 1
                 
         self.interaction_matrix = interaction_matrix
     

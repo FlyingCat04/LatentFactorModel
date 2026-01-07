@@ -162,7 +162,7 @@ class LatentFactorModel(nn.Module):
             cur.execute("""
                 SELECT "Id", "UserId", "ItemId", "Value", "ReviewText", "ConvertedScore"
                 FROM "Rating"
-                WHERE "DomainId" = %s
+                WHERE "DomainId" = %s AND "Value" IS NOT NULL
                 LIMIT %s
             """, (self.domain_id, limit_total))
             rows = cur.fetchall()
@@ -230,7 +230,7 @@ class LatentFactorModel(nn.Module):
             cur.execute("""
                 SELECT "Id", "UserId", "ItemId", "Value", "ReviewText", "ConvertedScore"
                 FROM "Rating"
-                WHERE "DomainId" = %s
+                WHERE "DomainId" = %s AND "Value" IS NOT NULL
                 LIMIT %s
             """, (self.domain_id, limit_total))
             rows = cur.fetchall()

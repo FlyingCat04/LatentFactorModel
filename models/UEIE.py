@@ -95,6 +95,14 @@ class LatentFactorModel(nn.Module):
             # self.items_list = sorted(list(self.item_emb_dict.keys()))
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
+            
+            # Filter ratings to only include valid users and items
+            original_count = len(self.ratings)
+            self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
+            filtered_count = original_count - len(self.ratings)
+            if filtered_count > 0:
+                print(f"⚠️ Filtered out {filtered_count} ratings with invalid user/item IDs")
+            
             self.compute_user_embeddings()
 
             self.mu = np.mean([r for _, _, r in self.ratings]) if self.ratings else 3.5
@@ -214,7 +222,7 @@ class LatentFactorModel(nn.Module):
             cur.execute("""
                 SELECT "UserId", "ItemId", "Value"
                 FROM "Rating"
-                WHERE "DomainId" = %s
+                WHERE "DomainId" = %s AND "Value" IS NOT NULL
                 LIMIT %s
             """, (self.domain_id, limit_total))
             rows = cur.fetchall()

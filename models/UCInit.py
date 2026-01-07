@@ -82,6 +82,14 @@ class LatentFactorModel(nn.Module):
             
             self.user2idx = {u: idx for idx, u in enumerate(self.users)}
             self.item2idx = {i: idx for idx, i in enumerate(self.items_list)}
+            
+            # Lọc ratings để chỉ giữ lại user/item hợp lệ
+            original_count = len(self.ratings)
+            self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
+            filtered = original_count - len(self.ratings)
+            if filtered > 0:
+                print(f"⚠️ Đã lọc bỏ {filtered} ratings với user/item ID không hợp lệ")
+            
             # self.ratings, self.test_ratings = train_test_split(self.ratings, test_size=0.2, random_state=42)
             self.ratings, self.test_ratings = self.ratings, []
             self.ratings_dict = {(u, i): r for u, i, r in self.ratings}
@@ -403,7 +411,8 @@ class LatentFactorModel(nn.Module):
 
         R = lil_matrix((self.n_users, self.n_items), dtype=np.float32)
         for u, i, r in self.ratings:
-            R[self.user2idx[u], self.item2idx[i]] = r
+            if u in self.user2idx and i in self.item2idx:
+                R[self.user2idx[u], self.item2idx[i]] = r
 
         R_top = R[top_v_idx, :].toarray()
         Q_init_matrix = R_top.T
@@ -518,7 +527,7 @@ class LatentFactorModel(nn.Module):
             cur.execute("""
                 SELECT "UserId", "ItemId", "Value"
                 FROM "Rating"
-                WHERE "DomainId" = %s
+                WHERE "DomainId" = %s AND "Value" IS NOT NULL
                 LIMIT %s
             """, (self.domain_id, limit_total))
             rows = cur.fetchall()

@@ -105,6 +105,7 @@ class PLA(nn.Module):
         # self.ueie_model = self.review_model
         # self.ucinit_model = self.review_model
         # self.iinit_model = self.review_model
+        self.load_user_item_from_db()
 
         # freeze submodels (important!)
         for param in self.review_model.parameters():
@@ -175,7 +176,36 @@ class PLA(nn.Module):
     #     self.theta = nn.Parameter(theta_tensor)
 
     #     print(f"✅ Loaded theta from DB, shape: {self.theta.shape}")
+
+    def load_user_item_from_db(self):
+        cur = self.connection.cursor()
+        try: 
+            cur.execute("""
+            SELECT "Id"
+            FROM "User"
+            WHERE "DomainId" = %s
+            ORDER BY "Id"
+            """, (self.domain_id,))
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"❌ Error querying users: {e}")
+            raise
+
+        self.users = [str(row[0]) for row in rows]
         
+        try:
+            cur.execute("""
+                SELECT "Id"
+                FROM "Item"
+                WHERE "DomainId" = %s
+                ORDER BY "Id"
+                """, (self.domain_id,))
+            rows = cur.fetchall()
+        except Exception as e:
+            print(f"❌ Error querying items: {e}")
+            raise
+        self.items = [str(row[0]) for row in rows]
+
     def load_theta_from_db(self):
         """
         Load tham số từ DB. Nếu gặp NULL hoặc sai kích thước -> Tự động Init Random.
@@ -223,7 +253,7 @@ class PLA(nn.Module):
             cur.execute("""
                 SELECT "UserId", "ItemId", "Value"
                 FROM "Rating"
-                WHERE "DomainId" = %s
+                WHERE "DomainId" = %s AND "Value" IS NOT NULL
                 LIMIT %s
             """, (self.domain_id, limit_total))
             rows = cur.fetchall()
@@ -238,11 +268,24 @@ class PLA(nn.Module):
         if total == 0:
             raise ValueError("❌ Zero ratings loaded from DB.")
 
-        train_count = int(total * ratio)
-        if train_count == 0: train_count = total
-
-        self.ratings = [(str(u), str(i), float(r)) for u, i, r in rows[:train_count]]
-        self.test_ratings = [(str(u), str(i), float(r)) for u, i, r in rows[train_count:]]
+        # Filter ratings to only include users/items that exist in all submodels
+        all_ratings = [(str(u), str(i), float(r)) for u, i, r in rows]
+        filtered_ratings = []
+        
+        for u, i, r in all_ratings:
+            # Check if user and item exist in all submodel mappings
+            if (u in self.review_model.user2idx and i in self.review_model.item2idx and
+                u in self.ueie_model.user2idx and i in self.ueie_model.item2idx and
+                u in self.ucinit_model.user2idx and i in self.ucinit_model.item2idx and
+                u in self.iinit_model.user2idx and i in self.iinit_model.item2idx):
+                filtered_ratings.append((u, i, r))
+        
+        if not filtered_ratings:
+            raise ValueError("❌ No valid ratings found after filtering for existing users/items in submodels.")
+        
+        self.ratings = filtered_ratings
+        self.test_ratings = []
+        print(f"✅ Loaded {len(self.ratings)}/{total} ratings (filtered for valid users/items in submodels)")
 
     def forward(self, u, i):
         # ---- 1. Get phi(u, i) ----
@@ -377,6 +420,10 @@ class PLA(nn.Module):
 
             prev_loss = epoch_loss
 
+        for item in self.items:
+            for user in self.users:
+                self.predict(user, item, 0)
+              
         print("✅ Training finished! θ parameters are now learned.")
 
     def predict(self, user, item, p):
@@ -414,7 +461,9 @@ class PLA(nn.Module):
             cur.execute(f"""
                 INSERT INTO "{table_name}" ("UserId", "ItemId", "Value")
                 VALUES (%s, %s, %s)
-                ON CONFLICT ("UserId", "ItemId") DO NOTHING;
+                ON CONFLICT ("UserId", "ItemId")
+                DO UPDATE SET
+                "Value" = EXCLUDED."Value";
             """, (user, item, value))
             self.connection.commit()
             print(f"✅ Prediction written.")

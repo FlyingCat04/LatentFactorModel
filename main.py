@@ -19,7 +19,7 @@ except ImportError as e:
     raise e
 
 DB_CONFIG = settings.DB_CONFIG
-MODEL_TYPES = ["PLA", "ReviewRating", "UEIE", "UCInit", "IInit"]
+MODEL_TYPES = ["PLA", "ReviewRating", "UEIE", "UCInit", "IInit 1", "IInit 2", "IInit 3", "IInit 4", "IInit 5", "IInit 6", "IInit 7", "IInit 8"]
 
 db_conn = None
 
@@ -65,15 +65,33 @@ def ensure_models_exist(cursor, domain_id):
             model_ids[name] = cursor.fetchone()[0]
     return model_ids
 
-def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, save):
+def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, save, interaction_type_id=0):
     print(f"\n⚡ Bắt đầu train sub-model: {name} (ID: {model_id})...")
-    model = ModelClass(
-        connection=db_conn,
-        domain_id=domain_id,
-        model_id=model_id,
-        k=90,
-        train_mode='train' 
-    )
+    # model = ModelClass(
+    #     connection=db_conn,
+    #     domain_id=domain_id,
+    #     model_id=model_id,
+    #     k=90,
+    #     train_mode='train' 
+    # )
+    if "iinit" in name.lower():
+        model = ModelClass(
+            connection=db_conn,
+            domain_id=domain_id,
+            model_id=model_id,
+            k=90,
+            train_mode='train',
+            interaction_type_id=interaction_type_id
+        )
+    else:
+        model = ModelClass(
+            connection=db_conn,
+            domain_id=domain_id,
+            model_id=model_id,
+            k=90,
+            train_mode='train' 
+        )
+
     model.train_model(epochs=epochs, batch_size=batch_size)
     
     if save:
@@ -98,7 +116,9 @@ def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, trai
             train_sub_model(UCInitModel, "UCInit", domain_id, model_map["UCInit"], epochs, batch_size, save)
             
             # Train IInit
-            train_sub_model(IInitModel, "IInit", domain_id, model_map["IInit"], epochs, batch_size, save)
+            # train_sub_model(IInitModel, "IInit", domain_id, model_map["IInit"], epochs, batch_size, save)
+            for i in range(1, 9):
+                train_sub_model(IInitModel, f"IInit {i}", domain_id, model_map[f"IInit {i}"], epochs, batch_size, save, interaction_type_id=i)
 
         print(f"\n🚀 Bắt đầu train PLA (ID: {model_map['PLA']})...")
         pla = PLA(

@@ -7,6 +7,7 @@ from sklearn.decomposition import NMF
 import psycopg2
 from tqdm import tqdm
 from scipy.sparse import lil_matrix
+from psycopg2 import extras
 
 class LatentFactorModel(nn.Module):
     def __init__(
@@ -19,7 +20,8 @@ class LatentFactorModel(nn.Module):
         domain_id=None,
         train_mode='train',
         device=None,
-        k=90
+        k=90,
+        interaction_type_id=0
     ):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,6 +43,7 @@ class LatentFactorModel(nn.Module):
         self.optimizer = None
         self.k = k
         self.domain_id = domain_id
+        self.interaction_type_id = interaction_type_id
         
         if self.train_mode == 'load':
             self.load_user_item_from_db()
@@ -53,6 +56,8 @@ class LatentFactorModel(nn.Module):
             self.load_ratings_from_db()
             if not self.ratings:
                 raise ValueError("❌ No training ratings available.")
+            if self.interaction_type_id == 0:
+                raise ValueError("❌ interaction_type_id must be greater than 0")
             
             users_in_train_set = set(u for u, _, _ in self.ratings)
             items_in_train_set = set(i for _, i, _ in self.ratings)
@@ -284,7 +289,8 @@ class LatentFactorModel(nn.Module):
         cur = self.connection.cursor()
         interaction_matrix = lil_matrix((self.n_users, self.n_items), dtype=np.int8)
         cur.execute(
-            'SELECT "UserId", "ItemId" FROM "Interaction"'
+            'SELECT "UserId", "ItemId" FROM "Interaction" WHERE "DomainId" = %s AND "InteractionTypeId" = %s',
+            (self.domain_id, self.interaction_type_id)
         )
         rows = cur.fetchall()
         for u, i in rows:

@@ -38,13 +38,13 @@ class LatentFactorModel(nn.Module):
         self.train_mode = train_mode.lower()
         self.k = k
         
-        self.ratings_reviews = None
-        self.test_ratings = None
+        self.ratings_reviews = []
+        self.test_ratings = []
         self.users = []
         self.items_list = []
         self.user2idx = {}
         self.item2idx = {}
-        self.mu = 0.0
+        self.mu = 3.5 # Default value safe for cold start
         self.model = None
         self.optimizer = None
         self.client = genai.Client(api_key="AIzaSyAma-rodMYxbC_jBQWxtwPrFof8tyEivws")
@@ -53,15 +53,15 @@ class LatentFactorModel(nn.Module):
         if self.train_mode not in ['train', 'load']:
             raise ValueError("❌ train_mode must be 'train' or 'load'")
 
-
         if self.train_mode == 'load':
             print("--- Loading Existing Model ---")
             self.load_user_item_from_db()
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             self.load_model_from_db(model_id=model_id) 
+            # Không raise error ở đây để PLA có thể tiếp tục chạy dù model con rỗng
             if self.model is None or not self.users or not self.items_list:
-                raise ValueError("❌ Failed to load model state completely.")
+                print("⚠️ Warning: Model loaded with empty/partial state. Using default behavior.")
 
         else: # train_mode == 'train'
             if self.k is None:
@@ -75,50 +75,78 @@ class LatentFactorModel(nn.Module):
                 self.load_ratings_from_db()
             else:
                 all_data = [(u,i,r,c) for u,i,r,c in ratings_and_reviews if u in self.user2idx and i in self.item2idx]
-                if not all_data:
-                    raise ValueError("❌ No valid ratings (all filtered out).")
-                # self.ratings_reviews, self.test_ratings_reviews = train_test_split(all_data, test_size=0, random_state=42)
-                self.ratings_reviews, self.test_ratings_reviews = all_data, []
-                
+                self.ratings_reviews = all_data if all_data else []
+                self.test_ratings_reviews = []
 
+            # Xử lý khi không có rating (Cold Start)
             if not self.ratings_reviews:
-                raise ValueError("❌ No training ratings available (hoặc tất cả rating đã bị lọc bỏ).")
-
-            self.mu = np.mean([r for _, _, r, _ in self.ratings_reviews]) if self.ratings_reviews else 3.5
+                print("⚠️ Warning: No training ratings available. Model will initialize with random weights.")
+                self.mu = 3.5 
+            else:
+                self.mu = np.mean([r for _, _, r, _ in self.ratings_reviews])
             
             n_users_final = len(self.users)
             n_items_final = len(self.items_list)
             
-            if n_users_final == 0 or n_items_final == 0:
-                raise ValueError(f"❌ Cannot initialize model with {n_users_final} users / {n_items_final} items.")
-            
+            # Khởi tạo model an toàn kể cả khi n_users=0
             self.model = self.ReviewRatingModel(n_users_final, n_items_final, self.k, self.mu).to(self.device)
 
             self.optimizer = optim.AdamW(self.model.parameters(), 
                                          lr=self.lr, 
                                          weight_decay=self.lam)
-            print("✅ Initialization complete and ready for training.")
+            print("✅ Initialization complete and ready.")
 
     class ReviewRatingModel(nn.Module):
         def __init__(self, n_users, n_items, k, mu, P_init=None, Q_init=None, b_u_init=None, b_i_init=None):
             super().__init__()
+            # Fix lỗi Embedding(0): Luôn đảm bảo tối thiểu là 1
+            n_users = max(n_users, 1)
+            n_items = max(n_items, 1)
+
             self.P = nn.Embedding(n_users, k)
             self.Q = nn.Embedding(n_items, k)
             self.b_u = nn.Embedding(n_users, 1)
             self.b_i = nn.Embedding(n_items, 1)
             self.mu = mu
             
-            if P_init is not None:
-                with torch.no_grad():
-                    self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
-                    self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
-                    self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
-                    self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
-            else:
-                nn.init.xavier_uniform_(self.P.weight)
-                nn.init.xavier_uniform_(self.Q.weight)
-                nn.init.zeros_(self.b_u.weight)
-                nn.init.zeros_(self.b_i.weight)
+            # --- SAFE COPY LOGIC ---
+            # Chỉ copy nếu shape khớp. Nếu DB rỗng (P_init shape 0), bỏ qua copy để dùng random init.
+            with torch.no_grad():
+                if P_init is not None:
+                    t = torch.tensor(P_init, dtype=torch.float32)
+                    if t.shape == self.P.weight.shape:
+                        self.P.weight.copy_(t)
+                    else:
+                        nn.init.xavier_uniform_(self.P.weight) # Fallback
+                else:
+                    nn.init.xavier_uniform_(self.P.weight)
+
+                if Q_init is not None:
+                    t = torch.tensor(Q_init, dtype=torch.float32)
+                    if t.shape == self.Q.weight.shape:
+                        self.Q.weight.copy_(t)
+                    else:
+                        nn.init.xavier_uniform_(self.Q.weight)
+                else:
+                    nn.init.xavier_uniform_(self.Q.weight)
+
+                if b_u_init is not None:
+                    t = torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1)
+                    if t.shape == self.b_u.weight.shape:
+                        self.b_u.weight.copy_(t)
+                    else:
+                        nn.init.zeros_(self.b_u.weight)
+                else:
+                    nn.init.zeros_(self.b_u.weight)
+
+                if b_i_init is not None:
+                    t = torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1)
+                    if t.shape == self.b_i.weight.shape:
+                        self.b_i.weight.copy_(t)
+                    else:
+                        nn.init.zeros_(self.b_i.weight)
+                else:
+                    nn.init.zeros_(self.b_i.weight)
 
         def forward(self, user_idx, item_idx):
             p_u = self.P(user_idx)
@@ -131,30 +159,15 @@ class LatentFactorModel(nn.Module):
     def load_user_item_from_db(self):
         cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "Id"
-                From "User"
-                WHERE "DomainId" = %s
-                ORDER BY "Id"
-            """, (self.domain_id,))
-            rows = cur.fetchall()
-        except Exception as e:
-            raise
+            cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+            self.users = [str(row[0]) for row in cur.fetchall()]
             
-        self.users = [str(row[0]) for row in rows]
-        
-        try:
-            cur.execute("""
-                SELECT "Id"
-                From "Item"
-                WHERE "DomainId" = %s
-                ORDER BY "Id"
-            """, (self.domain_id,))
-            rows = cur.fetchall()
+            cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+            self.items_list = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
-            raise
-        
-        self.items_list = [str(row[0]) for row in rows]
+            print(f"⚠️ Error loading users/items: {e}")
+            self.users = []
+            self.items_list = []
         
     def load_or_convert_reviews(self, limit_total=1000000):
         cur = self.connection.cursor()
@@ -171,22 +184,17 @@ class LatentFactorModel(nn.Module):
             return []
 
         results = []
-        for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
-            if converted is None:
-                # converted = self.review_to_rating(text)
-                converted = 3.0
-                try:
-                    cur.execute("""
-                        UPDATE "Rating" 
-                        SET "ConvertedScore" = %s
-                        WHERE "Id" = %s
-                    """, (converted, rid))
-                    self.connection.commit()
-                except Exception as e:
-                    print(f"⚠️ Error updating ConvertedScore for RatingID={rid}: {e}")
-                    self.connection.rollback()
-            
-            results.append((uid, iid, rating, converted))
+        if rows:
+            for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
+                if converted is None:
+                    converted = self.review_to_rating(text)
+                    try:
+                        cur.execute('UPDATE "Rating" SET "ConvertedScore" = %s WHERE "Id" = %s', (converted, rid))
+                        self.connection.commit()
+                    except Exception:
+                        self.connection.rollback()
+                
+                results.append((uid, iid, rating, converted))
 
         self.ratings_reviews_dict = {(u, i): (r, c) for u, i, r, c in results}
         
@@ -221,7 +229,6 @@ class LatentFactorModel(nn.Module):
             rating = 0
 
         time.sleep(12)
-        
         return rating
 
     def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
@@ -236,10 +243,13 @@ class LatentFactorModel(nn.Module):
             rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error loading reviews: {e}")
-            raise
+            rows = []
         
         if not rows:
-            raise ValueError("❌ No rating data loaded from DB.")
+            print("⚠️ No rating data loaded from DB. Proceeding with empty ratings.")
+            self.ratings_reviews = []
+            self.test_ratings_reviews = []
+            return
 
         results = []
         for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
@@ -249,14 +259,9 @@ class LatentFactorModel(nn.Module):
                 continue
 
             if converted is None:
-                # converted = self.review_to_rating(text)
-                converted = 3.0
+                converted = self.review_to_rating(text)
                 try:
-                    cur.execute("""
-                        UPDATE "Rating" 
-                        SET "ConvertedScore" = %s
-                        WHERE "Id" = %s
-                    """, (converted, rid))
+                    cur.execute('UPDATE "Rating" SET "ConvertedScore" = %s WHERE "Id" = %s', (converted, rid))
                     self.connection.commit()
                 except Exception as e:
                     print(f"⚠️ Error updating ConvertedScore for RatingID={rid}: {e}")
@@ -266,7 +271,10 @@ class LatentFactorModel(nn.Module):
 
         total = len(results)
         if total == 0:
-             raise ValueError("❌ Zero ratings loaded (or all were filtered out).")
+             print("⚠️ Zero ratings loaded (or all were filtered out). Proceeding with empty ratings.")
+             self.ratings_reviews = []
+             self.test_ratings_reviews = []
+             return
         
         train_count = int(total * ratio)
         if train_count == 0: train_count = total
@@ -275,7 +283,10 @@ class LatentFactorModel(nn.Module):
         self.test_ratings_reviews = [(str(u), str(i), float(r), float(c)) for u, i, r, c in results[train_count:]]
 
     def train_model(self, epochs=500, batch_size=512):
-        if not self.ratings_reviews: print("⚠️ No training data. Skipping."); return
+        if not self.ratings_reviews: 
+            print("⚠️ No training data. Skipping training loop.") 
+            return
+            
         if self.model is None: print("⚠️ Model not initialized. Skipping."); return
         if self.optimizer is None: print("⚠️ Optimizer not initialized. Skipping."); return
 
@@ -291,14 +302,13 @@ class LatentFactorModel(nn.Module):
             user_idx_all = torch.tensor(user_indices, device=self.device, dtype=torch.long)
             item_idx_all = torch.tensor(item_indices, device=self.device, dtype=torch.long)
             r_all = torch.tensor([r for _, _, r, _ in self.ratings_reviews], dtype=torch.float32, device=self.device)
+            z_all = torch.tensor([c for _, _, _, c in self.ratings_reviews], dtype=torch.float32, device=self.device)
         except KeyError as e:
             print(f"❌ ERROR preparing tensors: User or Item ID '{e}' missing from index map! Aborting training.")
             return
 
-        z_all = torch.tensor([c for _, _, _, c in self.ratings_reviews], dtype=torch.float32, device=self.device)
         for epoch in range(epochs):
             total_main_loss_sum = 0.0
-
             perm = torch.randperm(n, device=self.device)
             user_idx_shuffled = user_idx_all[perm]
             item_idx_shuffled = item_idx_all[perm]
@@ -327,13 +337,10 @@ class LatentFactorModel(nn.Module):
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
                 self.optimizer.step()
-
                 total_main_loss_sum += main_loss_mean.item() * current_batch_size
 
             avg_main_loss = total_main_loss_sum / n
-
             with torch.no_grad():
                 reg_p = torch.sum(self.model.P.weight**2)
                 reg_q = torch.sum(self.model.Q.weight**2)
@@ -343,10 +350,8 @@ class LatentFactorModel(nn.Module):
             final_reg_loss = 0.5 * self.lam * (reg_p + reg_q + reg_bu + reg_bi).item()
             avg_total_loss_to_track = avg_main_loss + final_reg_loss / n
             
-            # print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f}")
-
             if abs(prev_avg_loss - avg_total_loss_to_track) < tolerance:
-                print(f"✅ Early stopping at epoch {epoch+1} (|Δloss|={abs(prev_avg_loss - avg_total_loss_to_track):.6e} < {tolerance})")
+                print(f"✅ Early stopping at epoch {epoch+1}")
                 break
             prev_avg_loss = avg_total_loss_to_track
 
@@ -370,42 +375,34 @@ class LatentFactorModel(nn.Module):
             user_factor_data = []
             item_factor_data = []
             
-            users_in_train = set(u for u, _, _, _ in self.ratings_reviews)
-            items_in_train = set(i for _, i, _, _ in self.ratings_reviews)
+            users_in_train = set(u for u, _, _, _ in self.ratings_reviews) if self.ratings_reviews else set()
+            items_in_train = set(i for _, i, _, _ in self.ratings_reviews) if self.ratings_reviews else set()
 
             for user_id in self.users:
                 if user_id in users_in_train:
                     idx = self.user2idx[user_id]
                     user_factor_data.append((
-                        user_id,
-                        float(all_user_biases[idx]),
-                        all_user_factors[idx].tolist(),
-                        self.model_id
+                        user_id, float(all_user_biases[idx]), all_user_factors[idx].tolist(), self.model_id
                     ))
                 else:
-                    user_factor_data.append((
-                        user_id,
-                        0.0,
-                        [0.0]*self.k,
-                        self.model_id
-                    ))
+                    idx = self.user2idx.get(user_id)
+                    if idx is not None:
+                        user_factor_data.append((
+                            user_id, 0.0, all_user_factors[idx].tolist(), self.model_id
+                        ))
             
             for item_id in self.items_list:
                 if item_id in items_in_train:
                     idx = self.item2idx[item_id]
                     item_factor_data.append((
-                        item_id,
-                        float(all_item_biases[idx]),
-                        all_item_factors[idx].tolist(),
-                        self.model_id
+                        item_id, float(all_item_biases[idx]), all_item_factors[idx].tolist(), self.model_id
                     ))
                 else:
-                    item_factor_data.append((
-                        item_id,
-                        0.0,
-                        [0.0]*self.k,
-                        self.model_id
-                    ))
+                    idx = self.item2idx.get(item_id)
+                    if idx is not None:
+                        item_factor_data.append((
+                            item_id, 0.0, all_item_factors[idx].tolist(), self.model_id
+                        ))
 
             if user_factor_data:
                 sql_user = """
@@ -456,12 +453,10 @@ class LatentFactorModel(nn.Module):
         except Exception as e:
             print(f"❌ Error loading items/factors: {e}")
             raise
-        print(f"   Found {len(rows_items)} items in 'Item' table.")
-
+        
         for item_id, bias, factors in rows_items:
             item_id = str(item_id)
-            if item_id not in self.item2idx:
-                continue
+            if item_id not in self.item2idx: continue
             
             if bias is not None and factors is not None:
                 item_biases[item_id] = float(bias)
@@ -489,22 +484,20 @@ class LatentFactorModel(nn.Module):
 
         for user_id, bias, factors in rows_users:
             user_id = str(user_id)
-            if user_id not in self.user2idx:
-                continue
-            
+            if user_id not in self.user2idx: continue
             if bias is not None and factors is not None:
                 user_biases[user_id] = float(bias)
                 user_factors[user_id] = np.array(factors, dtype=float)
                 if self.k is None and len(user_factors[user_id]) > 0:
                     self.k = len(user_factors[user_id])
-                    print(f"   Inferred K={self.k} from loaded user factors.")
 
         if self.k is None:
-             raise ValueError("❌ Cannot determine K from loaded factors. Model load failed.")
+             print("⚠️ Warning: Cannot determine K from loaded factors. Using default K.")
 
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
+        # Tạo mảng init. Nếu n_users_loaded=0 thì mảng sẽ có shape (0, k)
         P_init_arr = np.zeros((n_users_loaded, self.k), dtype=float)
         Q_init_arr = np.zeros((n_items_loaded, self.k), dtype=float)
         b_u_init_arr = np.zeros(n_users_loaded, dtype=float)
@@ -524,8 +517,12 @@ class LatentFactorModel(nn.Module):
                 
         cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
         mu_row = cur.fetchone()
-        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3
+        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3.5
         
+        # Init model. Logic trong ReviewRatingModel sẽ check kích thước.
+        # Nếu n_users_loaded = 0 -> P_init_arr shape (0, k).
+        # Model ép n_users = 1 -> self.P shape (1, k).
+        # Shape lệch -> Dùng random init thay vì copy. -> KHÔNG CRASH.
         self.model = self.ReviewRatingModel(
             n_users_loaded, n_items_loaded, self.k, self.mu,
             P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr
@@ -536,15 +533,13 @@ class LatentFactorModel(nn.Module):
     
     def predict(self, user, item, p):
         if self.model is None:
-            return self.mu if self.mu else 3.0
+            return self.mu if self.mu else 3.5
 
         self.model.eval()
         with torch.no_grad():
             u_idx_val = self.user2idx.get(user)
             i_idx_val = self.item2idx.get(item)
             
-            # if p == 1:
-            #     print(u_idx_val, i_idx_val)
             if u_idx_val is None:
                 if i_idx_val is not None:
                     i_idx = torch.tensor([i_idx_val], device=self.device, dtype=torch.long)

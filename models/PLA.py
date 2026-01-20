@@ -38,7 +38,7 @@ class PLA(nn.Module):
 
         self.connection = connection
         self.domain_id = domain_id
-        self.ratings = None
+        self.ratings = [] # Initialize as empty list
         self.test_ratings = None
         self.theta = None
         self.k = k
@@ -130,6 +130,9 @@ class PLA(nn.Module):
 
         if self.train_mode == 'train':
             self.load_ratings_from_db()
+            if not self.ratings:
+                print("⚠️ Warning: No training ratings found for PLA. Model will rely on initial Theta/Random weights.")
+                # We do NOT raise ValueError here. We just proceed.
 
     def load_user_item_from_db(self):
         cur = self.connection.cursor()
@@ -141,7 +144,8 @@ class PLA(nn.Module):
             self.items = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
             print(f"❌ Error querying users/items: {e}")
-            raise
+            self.users = []
+            self.items = []
 
     def load_theta_from_db(self):
         cursor = self.connection.cursor()
@@ -151,10 +155,14 @@ class PLA(nn.Module):
 
         print("--- Loading Theta from DB ---")
         for name in model_order_names:
-            mid = self.model_ids_map[name]
-            cursor.execute('SELECT "LearnableParameters" FROM "Model" WHERE "Id" = %s', (mid,))
-            result = cursor.fetchone()
+            mid = self.model_ids_map.get(name)
+            if mid:
+                cursor.execute('SELECT "LearnableParameters" FROM "Model" WHERE "Id" = %s', (mid,))
+                result = cursor.fetchone()
+            else:
+                result = None
             
+            # Initialize random small noise
             arr = np.random.randn(expected_dim).astype(np.float32) * 0.1
             status = "🆕 NULL/Empty -> Random Init"
 
@@ -168,7 +176,8 @@ class PLA(nn.Module):
                         status = f"⚠️ Size Mismatch ({db_arr.size} vs {expected_dim}) -> Re-init"
                 except Exception:
                     status = "❌ Parse Error -> Re-init"
-            print(f"   - {name} (ID {mid}): {status}")
+            
+            # print(f"   - {name} (ID {mid}): {status}")
             thetas.append(arr)
 
         theta_matrix = np.stack(thetas, axis=0)
@@ -187,15 +196,16 @@ class PLA(nn.Module):
             rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
-            raise
+            rows = []
 
         if not rows:
-            raise ValueError("❌ No rating data loaded from DB.")
+            print("⚠️ No rating data loaded from DB (Cold start).")
+            self.ratings = []
+            return
 
         all_ratings = [(str(u), str(i), float(r)) for u, i, r in rows]
         
-        # --- FIXED FILTERING LOGIC ---
-        # Don't require intersection of submodels. Just require valid System User/Item
+        # --- FILTERING LOGIC ---
         valid_users = set(self.users)
         valid_items = set(self.items)
         
@@ -205,7 +215,8 @@ class PLA(nn.Module):
                 self.ratings.append((u, i, r))
         
         if not self.ratings:
-            raise ValueError("❌ No valid ratings found after filtering.")
+            print("⚠️ Warning: All ratings were filtered out (invalid user/item IDs).")
+            return
             
         print(f"✅ Loaded {len(self.ratings)} training ratings.")
 
@@ -216,34 +227,48 @@ class PLA(nn.Module):
         i_idx = self.review_model.item2idx.get(i)
         
         if u_idx is not None:
-            Pu = self.review_model.model.P(torch.tensor([u_idx], device=self.device)).squeeze(0)
+            # Check range to prevent index out of bounds if model mismatch
+            if u_idx < self.review_model.model.P.num_embeddings:
+                Pu = self.review_model.model.P(torch.tensor([u_idx], device=self.device)).squeeze(0)
+            else:
+                 Pu = torch.zeros(self.k, device=self.device)
         else:
             Pu = torch.zeros(self.k, device=self.device) # Fallback
 
         if i_idx is not None:
-            Qi = self.review_model.model.Q(torch.tensor([i_idx], device=self.device)).squeeze(0)
+            if i_idx < self.review_model.model.Q.num_embeddings:
+                Qi = self.review_model.model.Q(torch.tensor([i_idx], device=self.device)).squeeze(0)
+            else:
+                Qi = torch.zeros(self.k, device=self.device)
         else:
             Qi = torch.zeros(self.k, device=self.device) # Fallback
             
         phi = torch.cat([Pu, Qi], dim=-1)   # shape [2k]
 
-        # ---- 2. Get predictions from ALL submodels (FIXED) ----
+        # ---- 2. Get predictions from ALL submodels ----
         preds = []
         
-        # 3 model chính
-        preds.append(torch.tensor(self.review_model.predict(u, i, 0), dtype=torch.float32, device=self.device))
-        preds.append(torch.tensor(self.ueie_model.predict(u, i, 0), dtype=torch.float32, device=self.device))
-        preds.append(torch.tensor(self.ucinit_model.predict(u, i, 0), dtype=torch.float32, device=self.device))
-        
-        # 8 IInit Models (Loop 1 -> 8)
-        for idx in range(1, 9):
-            model = self.iinit_models[idx]
-            if model is not None:
+        # Helper to safely predict
+        def safe_predict(model):
+            try:
+                if model is None: return self.ucinit_model.mu
                 val = model.predict(u, i, 0)
-                preds.append(torch.tensor(val, dtype=torch.float32, device=self.device))
-            else:
-                # Fallback nếu model bị lỗi load hoặc không tồn tại
-                preds.append(torch.tensor(self.ucinit_model.mu, dtype=torch.float32, device=self.device))
+                # Ensure it returns a scalar float
+                if isinstance(val, (np.ndarray, list, torch.Tensor)):
+                    val = float(val)
+                return val
+            except Exception:
+                return self.ucinit_model.mu # Fallback to mean
+
+        # 3 Main Models
+        preds.append(torch.tensor(safe_predict(self.review_model), dtype=torch.float32, device=self.device))
+        preds.append(torch.tensor(safe_predict(self.ueie_model), dtype=torch.float32, device=self.device))
+        preds.append(torch.tensor(safe_predict(self.ucinit_model), dtype=torch.float32, device=self.device))
+        
+        # 8 IInit Models
+        for idx in range(1, 9):
+            val = safe_predict(self.iinit_models[idx])
+            preds.append(torch.tensor(val, dtype=torch.float32, device=self.device))
 
         r_s = torch.stack(preds)   # shape [11]
 
@@ -284,6 +309,8 @@ class PLA(nn.Module):
             total_reg += reg_loss
 
         n = len(batch)
+        if n == 0: return {"loss": 0, "main": 0, "priority": 0, "reg": 0}
+
         avg_loss = total_loss / n
         avg_loss.backward()
         self.optimizer.step()
@@ -296,6 +323,11 @@ class PLA(nn.Module):
         }
     
     def fit(self, n_epochs=500, batch_size=256, tol=1e-6):
+        if not self.ratings:
+            print("⚠️ No ratings to train PLA. Skipping training (Using Initialized Weights).")
+            self.save_predictions_to_db()
+            return
+
         self.train()
         n_samples = len(self.ratings)
         n_batches = (n_samples + batch_size - 1) // batch_size
@@ -314,7 +346,9 @@ class PLA(nn.Module):
                 losses = self.train_step(batch)
                 epoch_loss += losses["loss"]
 
-            epoch_loss /= n_batches
+            if n_batches > 0:
+                epoch_loss /= n_batches
+            
             print(f"Epoch {epoch:02d} | Loss: {epoch_loss:.6f}")
 
             if prev_loss is not None and abs(prev_loss - epoch_loss) < tol:
@@ -323,8 +357,6 @@ class PLA(nn.Module):
             prev_loss = epoch_loss
 
         print("✅ Training finished!")
-        # IMPORTANT: Do not run save_predictions loop here automatically.
-        # Call save_predictions_to_db() explicitly if needed.
         self.save_predictions_to_db() 
         
     def save_predictions_to_db(self):
@@ -336,7 +368,7 @@ class PLA(nn.Module):
         cur = self.connection.cursor()
         
         batch_data = []
-        batch_size = 2000 # Larger batch size for speed
+        batch_size = 2000 
         
         self.eval()
         with torch.no_grad():
@@ -388,15 +420,17 @@ class PLA(nn.Module):
         data_to_insert = []
         
         for idx, name in enumerate(model_order_names):
-            mid = self.model_ids_map[name]
-            theta_list = theta_values[idx].tolist()
-            data_to_insert.append((theta_list, mid))
+            mid = self.model_ids_map.get(name)
+            if mid:
+                theta_list = theta_values[idx].tolist()
+                data_to_insert.append((theta_list, mid))
 
         try:
-            query = 'UPDATE "Model" SET "LearnableParameters" = %s, "ModifiedAt" = NOW() WHERE "Id" = %s;'
-            psycopg2.extras.execute_batch(cur, query, data_to_insert)
-            self.connection.commit()
-            print(f"💾 Saved {len(data_to_insert)} theta vectors to DB.")
+            if data_to_insert:
+                query = 'UPDATE "Model" SET "LearnableParameters" = %s, "ModifiedAt" = NOW() WHERE "Id" = %s;'
+                psycopg2.extras.execute_batch(cur, query, data_to_insert)
+                self.connection.commit()
+                print(f"💾 Saved {len(data_to_insert)} theta vectors to DB.")
         except Exception as e:
             print(f"❌ Error saving model: {e}")
             self.connection.rollback()

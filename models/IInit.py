@@ -45,56 +45,73 @@ class LatentFactorModel(nn.Module):
         self.domain_id = domain_id
         self.interaction_type_id = interaction_type_id
         
+        # --- LOAD MODE ---
         if self.train_mode == 'load':
             self.load_user_item_from_db()
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: idx for idx, i in enumerate(self.items_list)}
             self.load_model_from_db(model_id)
             if self.model is None or not self.users or not self.items_list:
-                raise ValueError("❌ Failed to load model state completely.")
+                print("⚠️ Warning: Model load incomplete (maybe cold start). Continuing...")
+        
+        # --- TRAIN MODE ---
         else:
-            self.load_ratings_from_db()
-            if not self.ratings:
-                raise ValueError("❌ No training ratings available.")
-            if self.interaction_type_id == 0:
-                raise ValueError("❌ interaction_type_id must be greater than 0")
-            
-            users_in_train_set = set(u for u, _, _ in self.ratings)
-            items_in_train_set = set(i for _, i, _ in self.ratings)
-            users_in_train = list(users_in_train_set)
-            items_in_train = list(items_in_train_set)
-            
-            if not users_in_train or not items_in_train:
-                raise ValueError("❌ No users or items found in the training ratings.")
-            
+            # 1. Load basic info
             self.load_user_item_from_db()
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: idx for idx, i in enumerate(self.items_list)}
-            
-            # Filter ratings to only include valid users and items
-            original_count = len(self.ratings)
-            self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
-            filtered_count = original_count - len(self.ratings)
-            if filtered_count > 0:
-                print(f"⚠️ Filtered out {filtered_count} ratings with invalid user/item IDs")
-            
-            # self.ratings, self.test_ratings = train_test_split(self.ratings, test_size=0, random_state=42)
-            self.ratings, self.test_ratings = self.ratings, []
-
-            self.rating_dict = {(u, i): r for u, i, r in self.ratings}
             self.n_users = len(self.users)
             self.n_items = len(self.items_list)
-            self.mu = np.mean([r for _, _, r in self.ratings])
-            self.build_interaction_matrix()
-            P_map, Q_map, b_u_map, b_i_map = self.init_latent_model()
-            
-            P_init_arr = P_map
-            Q_init_arr = Q_map.T
-            b_u_init_arr = np.array([b_u_map[u] for u in self.users])
-            b_i_init_arr = np.array([b_i_map[i] for i in self.items_list])
 
+            # 2. Load Ratings
+            self.load_ratings_from_db()
+
+            # 3. Handle Empty Data vs Normal Flow
+            if not self.ratings:
+                print(f"⚠️ Warning: No training ratings available for InteractionTypeId={self.interaction_type_id}. Using Random Init.")
+                self.mu = 3.5
+                # Initialize random weights to avoid NMF crash on empty matrix
+                P_init_arr = np.random.normal(scale=0.01, size=(self.n_users, self.k))
+                Q_init_arr = np.random.normal(scale=0.01, size=(self.n_items, self.k))
+                b_u_init_arr = np.zeros(self.n_users)
+                b_i_init_arr = np.zeros(self.n_items)
+            
+            else:
+                if self.interaction_type_id == 0:
+                    raise ValueError("❌ interaction_type_id must be greater than 0")
+                
+                # Filter ratings
+                original_count = len(self.ratings)
+                self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
+                filtered_count = original_count - len(self.ratings)
+                if filtered_count > 0:
+                    print(f"⚠️ Filtered out {filtered_count} ratings with invalid user/item IDs")
+                
+                self.ratings, self.test_ratings = self.ratings, []
+
+                if not self.ratings:
+                     print("⚠️ All ratings filtered out. Using Random Init.")
+                     self.mu = 3.5
+                     P_init_arr = np.random.normal(scale=0.01, size=(self.n_users, self.k))
+                     Q_init_arr = np.random.normal(scale=0.01, size=(self.n_items, self.k))
+                     b_u_init_arr = np.zeros(self.n_users)
+                     b_i_init_arr = np.zeros(self.n_items)
+                else:
+                    # Normal Flow: Build Matrix -> NMF
+                    self.rating_dict = {(u, i): r for u, i, r in self.ratings}
+                    self.mu = np.mean([r for _, _, r in self.ratings])
+                    
+                    self.build_interaction_matrix()
+                    P_map, Q_map, b_u_map, b_i_map = self.init_latent_model()
+                    
+                    P_init_arr = P_map
+                    Q_init_arr = Q_map.T
+                    b_u_init_arr = np.array([b_u_map[u] for u in self.users])
+                    b_i_init_arr = np.array([b_i_map[i] for i in self.items_list])
+
+            # 4. Initialize Model (Safe for both empty and populated data)
             self.model = self.IInitModel(
-                self.n_users, self.n_items, self.k, self.mu,
+                max(self.n_users, 1), max(self.n_items, 1), self.k, self.mu,
                 P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr
             ).to(self.device)
             
@@ -115,10 +132,26 @@ class LatentFactorModel(nn.Module):
             self.mu = mu
             
             with torch.no_grad():
-                self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
-                self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
-                self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
-                self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
+                # Safe copy handling
+                if P_init is not None and P_init.shape == self.P.weight.shape:
+                    self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
+                else:
+                    nn.init.normal_(self.P.weight, 0, 0.01)
+
+                if Q_init is not None and Q_init.shape == self.Q.weight.shape:
+                    self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
+                else:
+                    nn.init.normal_(self.Q.weight, 0, 0.01)
+
+                if b_u_init is not None and len(b_u_init) == n_users:
+                    self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
+                else:
+                    nn.init.zeros_(self.b_u.weight)
+
+                if b_i_init is not None and len(b_i_init) == n_items:
+                    self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
+                else:
+                    nn.init.zeros_(self.b_i.weight)
                 
         def forward(self, user_idx, item_idx):
             p_u = self.P(user_idx)
@@ -138,10 +171,10 @@ class LatentFactorModel(nn.Module):
                 ORDER BY "Id"
             """, (self.domain_id,))
             rows = cur.fetchall()
+            self.users = [str(row[0]) for row in rows]
         except Exception as e:
-            raise
-            
-        self.users = [str(row[0]) for row in rows]
+            print(f"⚠️ Error loading users: {e}")
+            self.users = []
         
         try:
             cur.execute("""
@@ -151,10 +184,10 @@ class LatentFactorModel(nn.Module):
                 ORDER BY "Id"
             """, (self.domain_id,))
             rows = cur.fetchall()
+            self.items_list = [str(row[0]) for row in rows]
         except Exception as e:
-            raise
-        
-        self.items_list = [str(row[0]) for row in rows]
+            print(f"⚠️ Error loading items: {e}")
+            self.items_list = []
     
     def load_model_from_db(self, model_id):
         cur = self.connection.cursor()
@@ -217,7 +250,7 @@ class LatentFactorModel(nn.Module):
                     print(f" Inferred K={self.k} from loaded user factors.")
         
         if self.k is None:
-            raise ValueError("❌ Cannot determine K from loaded factors. Model load failed.")
+             print("⚠️ Warning: Cannot determine K from loaded factors. Using default.")
 
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
@@ -241,10 +274,10 @@ class LatentFactorModel(nn.Module):
                 
         cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
         mu_row = cur.fetchone()
-        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3
+        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3.5
         
         self.model = self.IInitModel(
-            n_users_loaded, n_items_loaded, self.k, self.mu,
+            max(n_users_loaded, 1), max(n_items_loaded, 1), self.k, self.mu,
             P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr
         ).to(self.device)
         self.model.eval()
@@ -252,33 +285,36 @@ class LatentFactorModel(nn.Module):
     def load_ratings_from_db(self, limit_total=1000000, ratio=1.0):
         cur = self.connection.cursor()
         try:
+            # Query from Interaction table, mapping to dummy rating=1
             cur.execute("""
-                SELECT "UserId", "ItemId", "Value"
-                FROM "Rating"
-                WHERE "DomainId" = %s AND "Value" IS NOT NULL
+                SELECT "UserId", "ItemId", 1.0
+                FROM "Interaction"
+                WHERE "DomainId" = %s AND "InteractionTypeId" = %s
                 LIMIT %s
-            """, (self.domain_id, limit_total))
+            """, (self.domain_id, self.interaction_type_id, limit_total))
             rows = cur.fetchall()
         except Exception as e:
-            print(f"❌ Error querying ratings: {e}")
-            raise
+            print(f"❌ Error querying interactions: {e}")
+            rows = []
         
         if not rows:
-            raise ValueError("❌ No rating data loaded from DB.")
+            print("⚠️ No interaction data loaded from DB (Cold start).")
+            self.ratings = []
+            self.test_ratings = []
+            return
 
         total = len(rows)
-        if total == 0:
-            raise ValueError("❌ Zero ratings loaded from DB.")
-        
         train_count = int(total * ratio)
-        if train_count == 0 or train_count == total:
-            if train_count == 0: train_count = total
-            if train_count == total: test_ratings = []
-
+        if train_count == 0 and total > 0: train_count = total
+        
         self.ratings = [(str(u), str(i), float(r)) for u, i, r in rows[:train_count]]
         self.test_ratings = [(str(u), str(i), float(r)) for u, i, r in rows[train_count:]]
     
     def IInit(self):
+        # Only run NMF if we have data
+        if self.interaction_matrix.sum() == 0:
+            return np.random.rand(self.n_users, self.k), np.random.rand(self.k, self.n_items)
+            
         model = NMF(n_components=self.k, init="random", random_state=42)
         P = model.fit_transform(self.interaction_matrix)
         Q = model.components_
@@ -288,17 +324,13 @@ class LatentFactorModel(nn.Module):
         # user x item
         cur = self.connection.cursor()
         interaction_matrix = lil_matrix((self.n_users, self.n_items), dtype=np.int8)
-        cur.execute(
-            'SELECT "UserId", "ItemId" FROM "Interaction" WHERE "DomainId" = %s AND "InteractionTypeId" = %s',
-            (self.domain_id, self.interaction_type_id)
-        )
-        rows = cur.fetchall()
-        for u, i in rows:
-            u_str = str(u)
-            i_str = str(i)
-            if u_str in self.user2idx and i_str in self.item2idx:
-                user_idx = self.user2idx[u_str]
-                item_idx = self.item2idx[i_str]
+        
+        # We already loaded ratings in self.ratings, so we can use that instead of querying DB again
+        # to ensure consistency with the train set
+        for u, i, _ in self.ratings:
+             if u in self.user2idx and i in self.item2idx:
+                user_idx = self.user2idx[u]
+                item_idx = self.item2idx[i]
                 interaction_matrix[user_idx, item_idx] = 1
                 
         self.interaction_matrix = interaction_matrix
@@ -310,6 +342,9 @@ class LatentFactorModel(nn.Module):
         return P, Q, b_u, b_i
     
     def train_model(self, epochs=500, batch_size=256):
+        if not self.ratings:
+            print("⚠️ No training data. Skipping training."); return
+            
         if self.model is None:
             raise ValueError("Model not initialized.")
         
@@ -369,8 +404,6 @@ class LatentFactorModel(nn.Module):
             final_reg_loss_total_sum = 0.5 * self.lam * (reg_p + reg_q + reg_bu + reg_bi).item()
             avg_total_loss_to_track = avg_mse_loss + final_reg_loss_total_sum / n
             
-            # print(f"Epoch {epoch_num+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f}")
-
             if abs(prev_avg_loss - avg_total_loss_to_track) < tol:
                 print(f"✅ Early stopping at epoch {epoch_num+1}")
                 break
@@ -409,12 +442,15 @@ class LatentFactorModel(nn.Module):
                         self.model_id
                     ))
                 else:
-                    user_factor_data.append((
-                        user_id,
-                        0.0,
-                        [0.0]*self.k,
-                        self.model_id
-                    ))
+                    # Save initialized factors (random) if not in train
+                    idx = self.user2idx.get(user_id)
+                    if idx is not None:
+                        user_factor_data.append((
+                            user_id,
+                            0.0,
+                            all_user_factors[idx].tolist(),
+                            self.model_id
+                        ))
             
             for item_id in self.items_list:
                 if item_id in items_in_train:
@@ -426,12 +462,14 @@ class LatentFactorModel(nn.Module):
                         self.model_id
                     ))
                 else:
-                    item_factor_data.append((
-                        item_id,
-                        0.0,
-                        [0.0]*self.k,
-                        self.model_id
-                    ))
+                    idx = self.item2idx.get(item_id)
+                    if idx is not None:
+                        item_factor_data.append((
+                            item_id,
+                            0.0,
+                            all_item_factors[idx].tolist(),
+                            self.model_id
+                        ))
 
             if user_factor_data:
                 sql_user = """
@@ -459,6 +497,7 @@ class LatentFactorModel(nn.Module):
             """, (float(self.mu), self.model_id))
             
             self.connection.commit()
+            print(f"✅ Saved model factors (Users: {len(user_factor_data)}, Items: {len(item_factor_data)})")
 
         except Exception as e:
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")

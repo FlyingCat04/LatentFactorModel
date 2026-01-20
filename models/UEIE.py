@@ -37,15 +37,15 @@ class LatentFactorModel(nn.Module):
         self.k = k
         self.tokenizer = None
         self.bert_model = None
-        self.ratings = None
-        self.test_ratings = None
+        self.ratings = [] 
+        self.test_ratings = []
         self.user_emb_dict = {}
         self.item_emb_dict = {}
         self.users = []
         self.items_list = []
         self.user2idx = {}
         self.item2idx = {}
-        self.mu = 0.0
+        self.mu = 3.5
         self.model = None
         self.optimizer = None
         self.inferred_prefs = None
@@ -65,7 +65,7 @@ class LatentFactorModel(nn.Module):
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             self.load_model_from_db(model_id=model_id)
             if self.model is None or not self.users or not self.items_list:
-                raise ValueError("❌ Failed to load model state completely.")
+                print("⚠️ Warning: Model load incomplete (maybe cold start). Continuing...")
 
         else:
             if self.k is None:
@@ -74,34 +74,34 @@ class LatentFactorModel(nn.Module):
             if ratings is None:
                 self.load_ratings_from_db(ratio=1)
             else:
-                # self.ratings, self.test_ratings = train_test_split(ratings, test_size=0.2, random_state=42)
                 self.ratings, self.test_ratings = ratings, []
 
+            # --- FIX: Handle Empty Ratings ---
             if not self.ratings:
-                raise ValueError("❌ No training ratings available.")
+                print("⚠️ Warning: No training ratings available. Model will initialize with zeros/random.")
+                users_in_train = []
+                items_in_train = []
+            else:
+                users_in_train_set = set(u for u, _, _ in self.ratings)
+                items_in_train_set = set(i for _, i, _ in self.ratings)
+                users_in_train = list(users_in_train_set)
+                items_in_train = list(items_in_train_set)
 
-            users_in_train_set = set(u for u, _, _ in self.ratings)
-            items_in_train_set = set(i for _, i, _ in self.ratings)
-            users_in_train = list(users_in_train_set)
-            items_in_train = list(items_in_train_set)
-
-            if not users_in_train or not items_in_train:
-                raise ValueError("❌ No users or items found in the training ratings.")
-
-            self.load_user_item_embeddings_from_db(users_in_train, items_in_train)
-            self.load_user_item_from_db()
+            # Only load embeddings if we have data
+            if users_in_train and items_in_train:
+                self.load_user_item_embeddings_from_db(users_in_train, items_in_train)
             
-            # self.users = sorted(list(self.user_emb_dict.keys()))
-            # self.items_list = sorted(list(self.item_emb_dict.keys()))
+            self.load_user_item_from_db()
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             
-            # Filter ratings to only include valid users and items
-            original_count = len(self.ratings)
-            self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
-            filtered_count = original_count - len(self.ratings)
-            if filtered_count > 0:
-                print(f"⚠️ Filtered out {filtered_count} ratings with invalid user/item IDs")
+            # Filter ratings
+            if self.ratings:
+                original_count = len(self.ratings)
+                self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
+                filtered_count = original_count - len(self.ratings)
+                if filtered_count > 0:
+                    print(f"⚠️ Filtered out {filtered_count} ratings with invalid user/item IDs")
             
             self.compute_user_embeddings()
 
@@ -109,36 +109,67 @@ class LatentFactorModel(nn.Module):
 
             n_users_final = len(self.users)
             n_items_final = len(self.items_list)
-            if n_users_final == 0 or n_items_final == 0:
-                raise ValueError(f"❌ Cannot initialize model with {n_users_final} users / {n_items_final} items.")
+            
+            # Safe init with max(n, 1) to prevent embedding(0) error
             self.model = self.UEIEModel(n_users_final, n_items_final, self.k, self.mu).to(self.device)
 
             self.optimizer = optim.AdamW(self.model.parameters(), 
                                    lr=self.lr, 
                                    weight_decay=self.lam)
+            
             self.inferred_prefs = self.compute_inferred_preferences()
-            print("✅ Initialization complete and ready for training.")
+            print("✅ Initialization complete and ready.")
 
     class UEIEModel(nn.Module):
         def __init__(self, n_users, n_items, k, mu, P_init=None, Q_init=None, b_u_init=None, b_i_init=None):
             super().__init__()
+            # Fix lỗi dimension: Luôn tối thiểu là 1
+            n_users = max(n_users, 1)
+            n_items = max(n_items, 1)
+
             self.P = nn.Embedding(n_users, k)
             self.Q = nn.Embedding(n_items, k)
             self.b_u = nn.Embedding(n_users, 1)
             self.b_i = nn.Embedding(n_items, 1)
             self.mu = mu
             
-            if P_init is not None:
-                with torch.no_grad():
-                    self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
-                    self.Q.weight.copy_(torch.tensor(Q_init, dtype=torch.float32))
-                    self.b_u.weight.copy_(torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1))
-                    self.b_i.weight.copy_(torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1))
-            else:
-                nn.init.xavier_uniform_(self.P.weight)
-                nn.init.xavier_uniform_(self.Q.weight)
-                nn.init.zeros_(self.b_u.weight)
-                nn.init.zeros_(self.b_i.weight)
+            # --- SAFE COPY LOGIC ---
+            with torch.no_grad():
+                if P_init is not None:
+                    t = torch.tensor(P_init, dtype=torch.float32)
+                    if t.shape == self.P.weight.shape:
+                        self.P.weight.copy_(t)
+                    else:
+                        nn.init.xavier_uniform_(self.P.weight)
+                else:
+                    nn.init.xavier_uniform_(self.P.weight)
+
+                if Q_init is not None:
+                    t = torch.tensor(Q_init, dtype=torch.float32)
+                    if t.shape == self.Q.weight.shape:
+                        self.Q.weight.copy_(t)
+                    else:
+                        nn.init.xavier_uniform_(self.Q.weight)
+                else:
+                    nn.init.xavier_uniform_(self.Q.weight)
+
+                if b_u_init is not None:
+                    t = torch.tensor(b_u_init, dtype=torch.float32).unsqueeze(1)
+                    if t.shape == self.b_u.weight.shape:
+                        self.b_u.weight.copy_(t)
+                    else:
+                        nn.init.zeros_(self.b_u.weight)
+                else:
+                    nn.init.zeros_(self.b_u.weight)
+
+                if b_i_init is not None:
+                    t = torch.tensor(b_i_init, dtype=torch.float32).unsqueeze(1)
+                    if t.shape == self.b_i.weight.shape:
+                        self.b_i.weight.copy_(t)
+                    else:
+                        nn.init.zeros_(self.b_i.weight)
+                else:
+                    nn.init.zeros_(self.b_i.weight)
 
         def forward(self, user_idx, item_idx):
             p_u = self.P(user_idx)
@@ -157,6 +188,9 @@ class LatentFactorModel(nn.Module):
             return
 
         k_dim_bert = 768
+        if self.item_emb_dict:
+             first_val = next(iter(self.item_emb_dict.values()))
+             k_dim_bert = len(first_val)
 
         user_ratings_map = defaultdict(list)
         for u, i, r in self.ratings:
@@ -191,30 +225,15 @@ class LatentFactorModel(nn.Module):
     def load_user_item_from_db(self):
         cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "Id"
-                From "User"
-                WHERE "DomainId" = %s
-                ORDER BY "Id"
-            """, (self.domain_id,))
-            rows = cur.fetchall()
-        except Exception as e:
-            raise
+            cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+            self.users = [str(row[0]) for row in cur.fetchall()]
             
-        self.users = [str(row[0]) for row in rows]
-        
-        try:
-            cur.execute("""
-                SELECT "Id"
-                From "Item"
-                WHERE "DomainId" = %s
-                ORDER BY "Id"
-            """, (self.domain_id,))
-            rows = cur.fetchall()
+            cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+            self.items_list = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
-            raise
-        
-        self.items_list = [str(row[0]) for row in rows]
+            print(f"⚠️ Error loading users/items: {e}")
+            self.users = []
+            self.items_list = []
         
     def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
         cur = self.connection.cursor()
@@ -228,19 +247,16 @@ class LatentFactorModel(nn.Module):
             rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
-            raise
+            rows = []
 
         if not rows:
-            raise ValueError("❌ No rating data loaded from DB.")
+            print("⚠️ No rating data loaded from DB (Cold start).")
+            self.ratings = []
+            self.test_ratings = []
+            return
 
-        total = len(rows)
-        if total == 0:
-            raise ValueError("❌ Zero ratings loaded from DB.")
-
-        train_count = int(total * ratio)
-        if train_count == 0 or train_count == total:
-            if train_count == 0: train_count = total
-            if train_count == total: test_ratings = []
+        train_count = int(len(rows) * ratio)
+        if train_count == 0 and len(rows) > 0: train_count = len(rows)
 
         self.ratings = [(str(u), str(i), float(r)) for u, i, r in rows[:train_count]]
         self.test_ratings = [(str(u), str(i), float(r)) for u, i, r in rows[train_count:]]
@@ -276,8 +292,9 @@ class LatentFactorModel(nn.Module):
             if emb_vec is not None:
                 try:
                     loaded_emb = np.array(emb_vec, dtype=float)
-                    if len(loaded_emb) == k_bert_dim:
+                    if len(loaded_emb) > 0:
                         self.item_emb_dict[item_id] = loaded_emb
+                        k_bert_dim = len(loaded_emb) 
                     else:
                         missing_items_info.append((item_id, desc))
                 except Exception as e:
@@ -294,16 +311,22 @@ class LatentFactorModel(nn.Module):
 
         if missing_items_info:
             if self.tokenizer is None or self.bert_model is None:
-                self.tokenizer, self.bert_model = self.load_bert()
-                if hasattr(self.bert_model, 'config') and hasattr(self.bert_model.config, 'dim'):
-                    k_bert_dim = self.bert_model.config.dim
-
+                try:
+                    self.tokenizer, self.bert_model = self.load_bert()
+                    if hasattr(self.bert_model, 'config') and hasattr(self.bert_model.config, 'dim'):
+                        k_bert_dim = self.bert_model.config.dim
+                except Exception as e:
+                    print(f"⚠️ Could not load BERT for missing items. Using zeros.")
+            
             for item_id, desc in tqdm(missing_items_info, desc="   Computing BERT/Zeros"):
                 if item_id not in self.item_emb_dict:
-                    bert_emb = self.get_embedding(desc)
-                    if bert_emb.shape[0] != k_bert_dim:
-                        bert_emb = np.zeros(k_bert_dim)
-                    self.item_emb_dict[item_id] = bert_emb
+                    if self.bert_model:
+                        bert_emb = self.get_embedding(desc)
+                        if bert_emb.shape[0] != k_bert_dim:
+                            bert_emb = np.zeros(k_bert_dim)
+                        self.item_emb_dict[item_id] = bert_emb
+                    else:
+                        self.item_emb_dict[item_id] = np.zeros(k_bert_dim)
         
         all_rows_users = []
         users_list_for_query = list(users_to_load)
@@ -334,7 +357,6 @@ class LatentFactorModel(nn.Module):
                     else:
                         self.user_emb_dict[user_id] = np.zeros(k_dim_for_user)
                 except Exception as e:
-                    print(f"⚠️ User {user_id}: Error converting embedding: {e}. Using zeros.")
                     self.user_emb_dict[user_id] = np.zeros(k_dim_for_user)
             else:
                 self.user_emb_dict[user_id] = np.zeros(k_dim_for_user)
@@ -342,7 +364,6 @@ class LatentFactorModel(nn.Module):
 
         users_not_in_db_table = set(users_to_load) - processed_user_ids
         if users_not_in_db_table:
-            print(f"   ⚠️ {len(users_not_in_db_table)} users from ratings were NOT found in 'User' table. Will use zero embeddings.")
             for user_id in users_not_in_db_table:
                 self.user_emb_dict[user_id] = np.zeros(k_dim_for_user)
 
@@ -367,8 +388,7 @@ class LatentFactorModel(nn.Module):
 
         for item_id, bias, factors in rows_items:
             item_id = str(item_id)
-            if item_id not in self.item2idx:
-                continue
+            if item_id not in self.item2idx: continue
             
             if bias is not None and factors is not None:
                 item_biases[item_id] = float(bias)
@@ -396,49 +416,28 @@ class LatentFactorModel(nn.Module):
 
         for user_id, bias, factors in rows_users:
             user_id = str(user_id)
-            if user_id not in self.user2idx:
-                continue
+            if user_id not in self.user2idx: continue
             
             if bias is not None and factors is not None:
                 user_biases[user_id] = float(bias)
                 user_factors[user_id] = np.array(factors, dtype=float)
                 if self.k is None and len(user_factors[user_id]) > 0:
                     self.k = len(user_factors[user_id])
-                    print(f"Inferred K={self.k} from loaded user factors.")
 
         if self.k is None:
-            raise ValueError("❌ Cannot determine K from loaded factors. Model load failed.")
+            print("⚠️ Warning: Cannot determine K from loaded factors. Using default.")
 
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
         cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
         mu_row = cur.fetchone()
-        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3
+        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3.5
 
+        # Initialize safely even if 0 users/items
         self.model = self.UEIEModel(n_users_loaded, n_items_loaded, self.k, self.mu).to(self.device)
         self.model.eval()
 
-        # with torch.no_grad():
-        #     loaded_params = 0
-        #     for user_id, bias in user_biases.items():
-        #         if user_id in self.user2idx:
-        #             self.model.b_u.weight[self.user2idx[user_id]] = bias
-        #             loaded_params +=1
-        #     for item_id, bias in item_biases.items():
-        #         if item_id in self.item2idx:
-        #             self.model.b_i.weight[self.item2idx[item_id]] = bias
-        #             loaded_params +=1
-        #     for user_id, factors in user_factors.items():
-        #          if user_id in self.user2idx:
-        #             if len(factors) == self.k:
-        #                 self.model.P.weight[self.user2idx[user_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
-        #                 loaded_params += self.k
-        #     for item_id, factors in item_factors.items():
-        #         if item_id in self.item2idx:
-        #             if len(factors) == self.k:
-        #                 self.model.Q.weight[self.item2idx[item_id]] = torch.tensor(factors, dtype=torch.float32, device=self.device)
-        #                 loaded_params += self.k
         print(f"✅ Loaded Factors/Biases into PyTorch Model for Prediction.")
 
     def load_bert(self):
@@ -456,7 +455,6 @@ class LatentFactorModel(nn.Module):
 
     def get_embedding(self, text):
         if self.tokenizer is None or self.bert_model is None:
-            print("      ⚠️ BERT model not loaded. Returning zero vector.")
             return np.zeros(768)
 
         if not text or not isinstance(text, str):
@@ -470,7 +468,6 @@ class LatentFactorModel(nn.Module):
             try:
                 outputs = self.bert_model(**inputs)
             except Exception as e:
-                print(f"      ⚠️ Error during BERT forward pass for text '{text[:50]}...': {e}")
                 k_bert_dim = self.bert_model.config.dim
                 return np.zeros(k_bert_dim)
 
@@ -485,10 +482,10 @@ class LatentFactorModel(nn.Module):
         return embedding
 
     def compute_inferred_preferences(self):
-        print("   Computing inferred preferences (z_ui)...")
         if not self.ratings:
-            print("⚠️ No ratings loaded. Cannot compute z_ui.")
+            print("⚠️ No ratings loaded. Cannot compute z_ui. Returning zero array.")
             return np.array([])
+            
         if not self.user_emb_dict or not self.item_emb_dict:
             print("⚠️ User or Item embedding dict is empty. Using zeros for z_ui.")
             return np.zeros(len(self.ratings))
@@ -508,18 +505,9 @@ class LatentFactorModel(nn.Module):
             item_vec = self.item_emb_dict.get(i)
 
             valid = True
-            if user_vec is None:
-                errors += 1
+            if user_vec is None or user_vec.shape[0] != k_dim_check:
                 valid = False
-            elif user_vec.shape[0] != k_dim_check:
-                errors += 1
-                valid = False
-
-            if item_vec is None:
-                errors += 1
-                valid = False
-            elif item_vec.shape[0] != k_dim_check:
-                errors += 1
+            if item_vec is None or item_vec.shape[0] != k_dim_check:
                 valid = False
 
             if valid:
@@ -530,6 +518,7 @@ class LatentFactorModel(nn.Module):
                     errors += 1
             else:
                 inferred[idx] = 0.0
+                errors += 1
 
         if errors > 0:
             print(f"⚠️ Encountered {errors} issues (missing/mismatched embeddings) during z_ui calculation.")
@@ -547,12 +536,12 @@ class LatentFactorModel(nn.Module):
                 print(f"⚠️ Error scaling z_ui: {e}. Using clipped unscaled values.")
                 return np.clip(inferred, 1.0, 5.0)
         else:
-            mu_val = self.mu if self.mu != 0.0 else 3.0
+            mu_val = self.mu if self.mu != 0.0 else 3.5
             print(f"⚠️ Inferred preferences have no variance. Scaling skipped. Using constant value: {mu_val:.2f}")
             return np.full(len(self.ratings), mu_val)
 
     def train_model(self, epochs=500, batch_size=256):
-        if not self.ratings: print("⚠️ No training data. Skipping."); return
+        if not self.ratings: print("⚠️ No training data. Skipping training."); return
         if self.model is None: print("⚠️ Model not initialized. Skipping."); return
         if self.optimizer is None: print("⚠️ Optimizer not initialized. Skipping."); return
 
@@ -579,7 +568,6 @@ class LatentFactorModel(nn.Module):
 
         for epoch in range(epochs):
             total_main_loss_sum = 0.0
-
             perm = torch.randperm(n, device=self.device)
             user_idx_shuffled = user_idx_all[perm]
             item_idx_shuffled = item_idx_all[perm]
@@ -589,15 +577,14 @@ class LatentFactorModel(nn.Module):
             for start in range(0, n, batch_size):
                 end = min(start + batch_size, n)
                 if start == end: continue
-
+                
                 u_batch = user_idx_shuffled[start:end]
                 i_batch = item_idx_shuffled[start:end]
                 r_batch = r_shuffled[start:end]
                 z_batch = z_shuffled[start:end]
                 current_batch_size = len(u_batch)
-
+                
                 r_hat = self.model(u_batch, i_batch)
-
                 err_r = r_batch - r_hat
                 err_z = z_batch - r_hat
                 main_loss_batch = 0.5 * (err_r**2 + self.weight * err_z**2)
@@ -606,15 +593,12 @@ class LatentFactorModel(nn.Module):
                 loss = main_loss_mean
                 self.optimizer.zero_grad()
                 loss.backward()
-
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
                 self.optimizer.step()
 
                 total_main_loss_sum += main_loss_mean.item() * current_batch_size
 
             avg_main_loss = total_main_loss_sum / n
-
             with torch.no_grad():
                 reg_p = torch.sum(self.model.P.weight**2)
                 reg_q = torch.sum(self.model.Q.weight**2)
@@ -623,8 +607,6 @@ class LatentFactorModel(nn.Module):
             
             final_reg_loss = 0.5 * self.lam * (reg_p + reg_q + reg_bu + reg_bi).item()
             avg_total_loss_to_track = avg_main_loss + final_reg_loss / n
-            
-            # print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_total_loss_to_track:.4f}")
 
             if abs(prev_avg_loss - avg_total_loss_to_track) < tolerance:
                 print(f"✅ Early stopping at epoch {epoch+1} (|Δloss|={abs(prev_avg_loss - avg_total_loss_to_track):.6e} < {tolerance})")
@@ -641,25 +623,25 @@ class LatentFactorModel(nn.Module):
         cur = self.connection.cursor()
         self.model.eval()
         
-        update_count_u, update_count_i = 0, 0
-        try:
-            for user_id in self.users:
-                if user_id in self.user_emb_dict:
-                    emb = self.user_emb_dict[user_id]
-                    cur.execute('UPDATE "User" SET "UserEmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), user_id))
-                    update_count_u += cur.rowcount
-            for item_id in self.items_list:
-                if item_id in self.item_emb_dict:
-                    emb = self.item_emb_dict[item_id]
-                    cur.execute('UPDATE "Item" SET "EmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), item_id))
-                    update_count_i += cur.rowcount
-            print(f"Updated embeddings for {update_count_u} users, {update_count_i} items.")
-            self.connection.commit()
-        except Exception as e:
-            print(f"❌ Error updating embeddings: {e}")
-            self.connection.rollback()
-            return
-
+        if self.user_emb_dict and self.item_emb_dict:
+            update_count_u, update_count_i = 0, 0
+            try:
+                for user_id in self.users:
+                    if user_id in self.user_emb_dict:
+                        emb = self.user_emb_dict[user_id]
+                        cur.execute('UPDATE "User" SET "UserEmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), user_id))
+                        update_count_u += cur.rowcount
+                for item_id in self.items_list:
+                    if item_id in self.item_emb_dict:
+                        emb = self.item_emb_dict[item_id]
+                        cur.execute('UPDATE "Item" SET "EmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), item_id))
+                        update_count_i += cur.rowcount
+                print(f"Updated embeddings for {update_count_u} users, {update_count_i} items.")
+                self.connection.commit()
+            except Exception as e:
+                print(f"❌ Error updating embeddings: {e}")
+                self.connection.rollback()
+        
         try:
             with torch.no_grad():
                 all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
@@ -670,42 +652,34 @@ class LatentFactorModel(nn.Module):
             user_factor_data = []
             item_factor_data = []
             
-            users_in_train = set(u for u, _, _ in self.ratings)
-            items_in_train = set(i for _, i, _ in self.ratings)
+            users_in_train = set(u for u, _, _ in self.ratings) if self.ratings else set()
+            items_in_train = set(i for _, i, _ in self.ratings) if self.ratings else set()
 
             for user_id in self.users:
                 if user_id in users_in_train:
                     idx = self.user2idx[user_id]
                     user_factor_data.append((
-                        user_id,
-                        float(all_user_biases[idx]),
-                        all_user_factors[idx].tolist(),
-                        self.model_id
+                        user_id, float(all_user_biases[idx]), all_user_factors[idx].tolist(), self.model_id
                     ))
                 else:
-                    user_factor_data.append((
-                        user_id,
-                        0.0,
-                        [0.0]*self.k,
-                        self.model_id
-                    ))
+                    idx = self.user2idx.get(user_id)
+                    if idx is not None:
+                        user_factor_data.append((
+                            user_id, 0.0, all_user_factors[idx].tolist(), self.model_id
+                        ))
             
             for item_id in self.items_list:
                 if item_id in items_in_train:
                     idx = self.item2idx[item_id]
                     item_factor_data.append((
-                        item_id,
-                        float(all_item_biases[idx]),
-                        all_item_factors[idx].tolist(),
-                        self.model_id
+                        item_id, float(all_item_biases[idx]), all_item_factors[idx].tolist(), self.model_id
                     ))
                 else:
-                    item_factor_data.append((
-                        item_id,
-                        0.0,
-                        [0.0]*self.k,
-                        self.model_id
-                    ))
+                    idx = self.item2idx.get(item_id)
+                    if idx is not None:
+                        item_factor_data.append((
+                            item_id, 0.0, all_item_factors[idx].tolist(), self.model_id
+                        ))
 
             if user_factor_data:
                 sql_user = """
@@ -733,9 +707,7 @@ class LatentFactorModel(nn.Module):
             """, (float(self.mu), self.model_id))
             
             self.connection.commit()
-            print(len(self.user2idx))
-            print(len(self.item2idx))
-
+            print(f"Saved model factors. Users: {len(self.user2idx)}, Items: {len(self.item2idx)}")
 
         except Exception as e:
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")
@@ -743,15 +715,13 @@ class LatentFactorModel(nn.Module):
     
     def predict(self, user, item, p):
         if self.model is None:
-            return self.mu if self.mu else 3.0
+            return self.mu if self.mu else 3.5
 
         self.model.eval()
         with torch.no_grad():
             u_idx_val = self.user2idx.get(user)
             i_idx_val = self.item2idx.get(item)
             
-            # if p == 1:
-            #     print(u_idx_val, i_idx_val)
             if u_idx_val is None:
                 if i_idx_val is not None:
                     i_idx = torch.tensor([i_idx_val], device=self.device, dtype=torch.long)

@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from config import settings
 import sys
+import asyncio
 
 # --- IMPORT ĐẦY ĐỦ CÁC MODEL ---
 try:
@@ -22,7 +23,7 @@ DB_CONFIG = settings.DB_CONFIG
 MODEL_TYPES = ["PLA", "ReviewRating", "UEIE", "UCInit", "IInit 1", "IInit 2", "IInit 3", "IInit 4", "IInit 5", "IInit 6", "IInit 7", "IInit 8"]
 
 db_conn = None
-
+training_lock = asyncio.Lock()
 class TrainRequest(BaseModel):
     domain_id: int
     epochs: int = 500
@@ -144,21 +145,25 @@ def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, trai
         db_conn.rollback()
 
 @app.post("/api/train", status_code=202)
-def trigger_training(req: TrainRequest, background_tasks: BackgroundTasks):
-    if not db_conn:
-        raise HTTPException(status_code=503, detail="Database chưa kết nối.")
+async def trigger_training(req: TrainRequest, background_tasks: BackgroundTasks):
+    # 2. Kiểm tra nếu đang có task chạy thì báo bận ngay
+    if training_lock.locked():
+        raise HTTPException(
+            status_code=429, 
+            detail="Hệ thống đang bận xử lý một request training khác. Vui lòng thử lại sau."
+        )
     
-    background_tasks.add_task(
-        run_training_task, 
-        req.domain_id, 
-        req.epochs,
-        req.pla_epochs,
-        req.batch_size, 
-        req.tolerance, 
-        req.save_after_train,
-        req.train_submodels
-    )
-    return {"message": f"Pipeline Training started for Domain {req.domain_id}", "config": req}
+    # 3. Hàm wrapper để tự động giải phóng lock khi xong hoặc lỗi
+    async def wrapped_task():
+        async with training_lock:
+            run_training_task(
+                req.domain_id, req.epochs, req.pla_epochs, 
+                req.batch_size, req.tolerance, req.save_after_train, 
+                req.train_submodels
+            )
+
+    background_tasks.add_task(wrapped_task)
+    return {"message": f"Pipeline Training started for Domain {req.domain_id}"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

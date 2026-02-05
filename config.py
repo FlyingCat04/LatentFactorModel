@@ -9,6 +9,9 @@ class Settings:
     DB_HOST = os.getenv("DB_HOST")
     DB_PASSWORD = os.getenv("DB_PASSWORD")
     DB_PORT = os.getenv("DB_PORT", "5432")
+    
+    APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
+    APP_PORT = int(os.getenv("APP_PORT", "8000"))
 
     @property
     def DB_CONFIG(self):

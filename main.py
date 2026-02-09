@@ -22,8 +22,7 @@ except ImportError as e:
 DB_CONFIG = settings.DB_CONFIG
 MODEL_TYPES = ["PLA", "ReviewRating", "UEIE", "UCInit", "IInit 1", "IInit 2", "IInit 3", "IInit 4", "IInit 5", "IInit 6", "IInit 7", "IInit 8"]
 
-db_conn = None
-# Sử dụng Queue thay vì Lock để xếp hàng các request
+# Queue để xếp hàng
 training_queue = asyncio.Queue()
 
 class TrainRequest(BaseModel):
@@ -39,14 +38,13 @@ async def worker_process_queue():
     """Hàm worker chạy nền để xử lý từng request trong queue"""
     print("👷 Queue Worker started waiting for tasks...")
     while True:
-        # Chờ và lấy task tiếp theo từ hàng đợi
         task_args = await training_queue.get()
         domain_id = task_args['domain_id']
         
-        print(f"🔄 [Queue] Start processing Domain {domain_id}. Pending in queue: {training_queue.qsize()}")
+        print(f"🔄 [Queue] Start processing Domain {domain_id}. Pending: {training_queue.qsize()}")
         
         try:
-            # Chạy hàm training (vốn là đồng bộ) trong một thread riêng để không block API
+            # Chạy hàm training trong thread riêng để không block API
             await asyncio.to_thread(
                 run_training_task,
                 task_args['domain_id'],
@@ -60,30 +58,17 @@ async def worker_process_queue():
         except Exception as e:
             print(f"❌ [Queue] Error processing domain {domain_id}: {e}")
         finally:
-            # Đánh dấu task đã xong để queue biết
             training_queue.task_done()
             print(f"✅ [Queue] Finished Domain {domain_id}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_conn
-    print("🔄 [Startup] Đang khởi tạo hệ thống...")
-    try:
-        db_conn = psycopg2.connect(**DB_CONFIG)
-        print("✅ Database connected successfully.")
-    except Exception as e:
-        print(f"❌ Lỗi kết nối Database: {e}")
-    
     # Khởi động worker khi app start
     worker_task = asyncio.create_task(worker_process_queue())
-    
+    print("🚀 System started.")
     yield
-    
-    print("🛑 [Shutdown] Đóng kết nối...")
-    # Clean up
+    print("🛑 System shutting down.")
     worker_task.cancel()
-    if db_conn:
-        db_conn.close()
 
 app = FastAPI(title="Recommender Training API", lifespan=lifespan)
 
@@ -104,11 +89,16 @@ def ensure_models_exist(cursor, domain_id):
             model_ids[name] = cursor.fetchone()[0]
     return model_ids
 
-def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, save, interaction_type_id=0):
+def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, save, conn, interaction_type_id=0):
+    """
+    Hàm train sub-model nhận conn từ bên ngoài truyền vào.
+    """
     print(f"\n⚡ Bắt đầu train sub-model: {name} (ID: {model_id})...")
+    
+    # Khởi tạo model với connection được truyền vào
     if "iinit" in name.lower():
         model = ModelClass(
-            connection=db_conn,
+            connection=conn,
             domain_id=domain_id,
             model_id=model_id,
             k=90,
@@ -117,7 +107,7 @@ def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, s
         )
     else:
         model = ModelClass(
-            connection=db_conn,
+            connection=conn,
             domain_id=domain_id,
             model_id=model_id,
             k=90,
@@ -132,52 +122,65 @@ def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, s
     print(f"✅ Đã xong {name}.")
 
 def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, train_submodels):
-    global db_conn
+    """
+    Hàm thực thi chính. 
+    QUAN TRỌNG: Quản lý vòng đời kết nối DB chặt chẽ (Open -> Train -> Close).
+    """
+    print(f"🔌 [Domain {domain_id}] Opening FRESH DB connection...")
+    conn = None
+    
     try:
-        # Kiểm tra kết nối lại nếu bị đóng (đề phòng)
-        if db_conn.closed:
-             db_conn = psycopg2.connect(**DB_CONFIG)
-
-        cur = db_conn.cursor()
-        model_map = ensure_models_exist(cur, domain_id)
-        db_conn.commit()
-        print(f"ℹ️ Training context: {model_map}")
-
-        if train_submodels:
-            train_sub_model(ReviewRatingModel, "ReviewRating", domain_id, model_map["ReviewRating"], epochs, batch_size, save)
-            train_sub_model(UEIEModel, "UEIE", domain_id, model_map["UEIE"], epochs, batch_size, save)
-            train_sub_model(UCInitModel, "UCInit", domain_id, model_map["UCInit"], epochs, batch_size, save)
-            for i in range(1, 9):
-                train_sub_model(IInitModel, f"IInit {i}", domain_id, model_map[f"IInit {i}"], epochs, batch_size, save, interaction_type_id=i)
-
-        print(f"\n🚀 Bắt đầu train PLA (ID: {model_map['PLA']})...")
-        pla = PLA(
-            connection=db_conn,
-            domain_id=domain_id,
-            model_ids_map=model_map,
-            k=90,
-            train_mode='train'
-        )
+        conn = psycopg2.connect(**DB_CONFIG)
         
-        pla.fit(n_epochs=pla_epochs, batch_size=batch_size, tol=tol)
-        
-        if save:
-            print("💾 Saving PLA theta...")
-            pla.write_model_to_db()
+        try:
+            cur = conn.cursor()
+            model_map = ensure_models_exist(cur, domain_id)
+            conn.commit()
+            print(f"ℹ️ [Domain {domain_id}] Context: {model_map}")
+
+            if train_submodels:
+                train_sub_model(ReviewRatingModel, "ReviewRating", domain_id, model_map["ReviewRating"], epochs, batch_size, save, conn)
+                train_sub_model(UEIEModel, "UEIE", domain_id, model_map["UEIE"], epochs, batch_size, save, conn)
+                train_sub_model(UCInitModel, "UCInit", domain_id, model_map["UCInit"], epochs, batch_size, save, conn)
+                for i in range(1, 9):
+                    train_sub_model(IInitModel, f"IInit {i}", domain_id, model_map[f"IInit {i}"], epochs, batch_size, save, conn, interaction_type_id=i)
+
+            print(f"\n🚀 [Domain {domain_id}] Training PLA...")
+            pla = PLA(
+                connection=conn,
+                domain_id=domain_id,
+                model_ids_map=model_map,
+                k=90,
+                train_mode='train'
+            )
             
-        print("\n🎉🎉🎉 TOÀN BỘ QUÁ TRÌNH TRAINING HOÀN TẤT! 🎉🎉🎉")
+            pla.fit(n_epochs=pla_epochs, batch_size=batch_size, tol=tol)
+            
+            if save:
+                print(f"💾 [Domain {domain_id}] Saving PLA theta...")
+                pla.write_model_to_db()
+            
+            conn.commit()
+            print(f"\n🎉 [Domain {domain_id}] TRAINING SUCCESSFUL! 🎉")
+
+        except Exception as inner_e:
+            if conn:
+                conn.rollback()
+            raise inner_e
 
     except Exception as e:
-        print(f"❌ CRITICAL ERROR in training task: {e}")
+        print(f"❌ [Domain {domain_id}] CRITICAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        # Rollback nếu có lỗi DB transaction
-        if db_conn and not db_conn.closed:
-            db_conn.rollback()
+        
+    finally:
+        if conn is not None:
+            conn.close()
+            print(f"🔌 [Domain {domain_id}] DB Connection CLOSED properly.")
 
 @app.post("/api/train", status_code=202)
 async def trigger_training(req: TrainRequest):
-    # Đẩy vào hàng đợi, không bao giờ reject trừ khi queue đầy (mặc định queue vô hạn)
+    # Đẩy vào queue
     await training_queue.put({
         'domain_id': req.domain_id,
         'epochs': req.epochs,
@@ -195,4 +198,4 @@ async def trigger_training(req: TrainRequest):
     }
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=settings.APP_HOST, port=settings.APP_PORT, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

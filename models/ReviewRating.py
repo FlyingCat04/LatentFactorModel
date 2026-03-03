@@ -11,7 +11,7 @@ from tqdm import tqdm
 class LatentFactorModel(nn.Module):
     def __init__(
         self,
-        connection,
+        db_config=None, # THAY ĐỔI: Nhận db_config
         ratings_and_reviews=None, 
         items=None,
         k=90,
@@ -27,9 +27,9 @@ class LatentFactorModel(nn.Module):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        self.connection = connection
-        if self.connection is None:
-            raise ValueError("❌ DB connection is required for all modes.")
+        self.db_config = db_config # THAY ĐỔI
+        if self.db_config is None:
+            raise ValueError("❌ DB config is required for all modes.")
 
         self.weight = weight
         self.lam = lam
@@ -59,7 +59,6 @@ class LatentFactorModel(nn.Module):
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             self.load_model_from_db(model_id=model_id) 
-            # Không raise error ở đây để PLA có thể tiếp tục chạy dù model con rỗng
             if self.model is None or not self.users or not self.items_list:
                 print("⚠️ Warning: Model loaded with empty/partial state. Using default behavior.")
 
@@ -110,7 +109,6 @@ class LatentFactorModel(nn.Module):
             self.mu = mu
             
             # --- SAFE COPY LOGIC ---
-            # Chỉ copy nếu shape khớp. Nếu DB rỗng (P_init shape 0), bỏ qua copy để dùng random init.
             with torch.no_grad():
                 if P_init is not None:
                     t = torch.tensor(P_init, dtype=torch.float32)
@@ -156,47 +154,51 @@ class LatentFactorModel(nn.Module):
             dot_product = (p_u * q_i).sum(dim=1)
             return self.mu + b_u + b_i + dot_product
     
+    # THAY ĐỔI: Tự mở và đóng kết nối
     def load_user_item_from_db(self):
-        cur = self.connection.cursor()
         try:
-            cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
-            self.users = [str(row[0]) for row in cur.fetchall()]
-            
-            cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
-            self.items_list = [str(row[0]) for row in cur.fetchall()]
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.users = [str(row[0]) for row in cur.fetchall()]
+                    
+                    cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.items_list = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
             print(f"⚠️ Error loading users/items: {e}")
             self.users = []
             self.items_list = []
         
+    # THAY ĐỔI: Tự mở và đóng kết nối
     def load_or_convert_reviews(self, limit_total=1000000):
-        cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "Id", "UserId", "ItemId", "Value", "ReviewText", "ConvertedScore"
-                FROM "Rating"
-                WHERE "DomainId" = %s AND "Value" IS NOT NULL
-                LIMIT %s
-            """, (self.domain_id, limit_total))
-            rows = cur.fetchall()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "Id", "UserId", "ItemId", "Value", "ReviewText", "ConvertedScore"
+                        FROM "Rating"
+                        WHERE "DomainId" = %s AND "Value" IS NOT NULL
+                        LIMIT %s
+                    """, (self.domain_id, limit_total))
+                    rows = cur.fetchall()
+
+                    results = []
+                    if rows:
+                        for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
+                            if converted is None:
+                                converted = self.review_to_rating(text)
+                                try:
+                                    cur.execute('UPDATE "Rating" SET "ConvertedScore" = %s WHERE "Id" = %s', (converted, rid))
+                                    conn.commit()
+                                except Exception:
+                                    conn.rollback()
+                            
+                            results.append((uid, iid, rating, converted))
+
+                    self.ratings_reviews_dict = {(u, i): (r, c) for u, i, r, c in results}
         except Exception as e:
             print(f"❌ Error loading reviews: {e}")
             return []
-
-        results = []
-        if rows:
-            for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
-                if converted is None:
-                    converted = self.review_to_rating(text)
-                    try:
-                        cur.execute('UPDATE "Rating" SET "ConvertedScore" = %s WHERE "Id" = %s', (converted, rid))
-                        self.connection.commit()
-                    except Exception:
-                        self.connection.rollback()
-                
-                results.append((uid, iid, rating, converted))
-
-        self.ratings_reviews_dict = {(u, i): (r, c) for u, i, r, c in results}
         
     def review_to_rating(self, review_text):
         if str(review_text).strip() == "" or review_text == None:
@@ -231,43 +233,47 @@ class LatentFactorModel(nn.Module):
         time.sleep(12)
         return rating
 
+    # THAY ĐỔI: Tự mở và đóng kết nối
     def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
-        cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "Id", "UserId", "ItemId", "Value", "ReviewText", "ConvertedScore"
-                FROM "Rating"
-                WHERE "DomainId" = %s AND "Value" IS NOT NULL
-                LIMIT %s
-            """, (self.domain_id, limit_total))
-            rows = cur.fetchall()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "Id", "UserId", "ItemId", "Value", "ReviewText", "ConvertedScore"
+                        FROM "Rating"
+                        WHERE "DomainId" = %s AND "Value" IS NOT NULL
+                        LIMIT %s
+                    """, (self.domain_id, limit_total))
+                    rows = cur.fetchall()
+                    
+                    if not rows:
+                        print("⚠️ No rating data loaded from DB. Proceeding with empty ratings.")
+                        self.ratings_reviews = []
+                        self.test_ratings_reviews = []
+                        return
+
+                    results = []
+                    for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
+                        uid = str(uid)
+                        iid = str(iid)
+                        if uid not in self.user2idx or iid not in self.item2idx:
+                            continue
+
+                        if converted is None:
+                            converted = self.review_to_rating(text)
+                            try:
+                                cur.execute('UPDATE "Rating" SET "ConvertedScore" = %s WHERE "Id" = %s', (converted, rid))
+                                conn.commit()
+                            except Exception as e:
+                                print(f"⚠️ Error updating ConvertedScore for RatingID={rid}: {e}")
+                                conn.rollback()
+                        
+                        results.append((uid, iid, rating, converted))
         except Exception as e:
             print(f"❌ Error loading reviews: {e}")
-            rows = []
-        
-        if not rows:
-            print("⚠️ No rating data loaded from DB. Proceeding with empty ratings.")
             self.ratings_reviews = []
             self.test_ratings_reviews = []
             return
-
-        results = []
-        for rid, uid, iid, rating, text, converted in tqdm(rows, desc="Processing Reviews"):
-            uid = str(uid)
-            iid = str(iid)
-            if uid not in self.user2idx or iid not in self.item2idx:
-                continue
-
-            if converted is None:
-                converted = self.review_to_rating(text)
-                try:
-                    cur.execute('UPDATE "Rating" SET "ConvertedScore" = %s WHERE "Id" = %s', (converted, rid))
-                    self.connection.commit()
-                except Exception as e:
-                    print(f"⚠️ Error updating ConvertedScore for RatingID={rid}: {e}")
-                    self.connection.rollback()
-            
-            results.append((uid, iid, rating, converted))
 
         total = len(results)
         if total == 0:
@@ -357,147 +363,146 @@ class LatentFactorModel(nn.Module):
 
         print("🏁 Training finished.")
 
+    # THAY ĐỔI: Tự mở và đóng kết nối để ghi Database
     def write_model_to_db(self):
         if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
-        if self.connection is None: raise ValueError("❌ DB connection required.")
+        if self.db_config is None: raise ValueError("❌ DB config required.")
         if self.model is None: print("⚠️ Model not trained. Cannot save."); return
 
-        cur = self.connection.cursor()
         self.model.eval()
 
-        try:
-            with torch.no_grad():
-                all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
-                all_user_factors = self.model.P.weight.cpu().numpy()
-                all_item_biases = self.model.b_i.weight.squeeze().cpu().numpy()
-                all_item_factors = self.model.Q.weight.cpu().numpy()
+        with torch.no_grad():
+            all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
+            all_user_factors = self.model.P.weight.cpu().numpy()
+            all_item_biases = self.model.b_i.weight.squeeze().cpu().numpy()
+            all_item_factors = self.model.Q.weight.cpu().numpy()
 
-            user_factor_data = []
-            item_factor_data = []
-            
-            users_in_train = set(u for u, _, _, _ in self.ratings_reviews) if self.ratings_reviews else set()
-            items_in_train = set(i for _, i, _, _ in self.ratings_reviews) if self.ratings_reviews else set()
+        user_factor_data = []
+        item_factor_data = []
+        
+        users_in_train = set(u for u, _, _, _ in self.ratings_reviews) if self.ratings_reviews else set()
+        items_in_train = set(i for _, i, _, _ in self.ratings_reviews) if self.ratings_reviews else set()
 
-            for user_id in self.users:
-                if user_id in users_in_train:
-                    idx = self.user2idx[user_id]
+        for user_id in self.users:
+            if user_id in users_in_train:
+                idx = self.user2idx[user_id]
+                user_factor_data.append((
+                    user_id, float(all_user_biases[idx]), all_user_factors[idx].tolist(), self.model_id
+                ))
+            else:
+                idx = self.user2idx.get(user_id)
+                if idx is not None:
                     user_factor_data.append((
-                        user_id, float(all_user_biases[idx]), all_user_factors[idx].tolist(), self.model_id
+                        user_id, 0.0, all_user_factors[idx].tolist(), self.model_id
                     ))
-                else:
-                    idx = self.user2idx.get(user_id)
-                    if idx is not None:
-                        user_factor_data.append((
-                            user_id, 0.0, all_user_factors[idx].tolist(), self.model_id
-                        ))
-            
-            for item_id in self.items_list:
-                if item_id in items_in_train:
-                    idx = self.item2idx[item_id]
+        
+        for item_id in self.items_list:
+            if item_id in items_in_train:
+                idx = self.item2idx[item_id]
+                item_factor_data.append((
+                    item_id, float(all_item_biases[idx]), all_item_factors[idx].tolist(), self.model_id
+                ))
+            else:
+                idx = self.item2idx.get(item_id)
+                if idx is not None:
                     item_factor_data.append((
-                        item_id, float(all_item_biases[idx]), all_item_factors[idx].tolist(), self.model_id
+                        item_id, 0.0, all_item_factors[idx].tolist(), self.model_id
                     ))
-                else:
-                    idx = self.item2idx.get(item_id)
-                    if idx is not None:
-                        item_factor_data.append((
-                            item_id, 0.0, all_item_factors[idx].tolist(), self.model_id
-                        ))
 
-            if user_factor_data:
-                sql_user = """
-                INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
-                    "UserBias" = EXCLUDED."UserBias",
-                    "UserFactors" = EXCLUDED."UserFactors";
-                """
-                psycopg2.extras.execute_batch(cur, sql_user, user_factor_data)
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    if user_factor_data:
+                        sql_user = """
+                        INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
+                            "UserBias" = EXCLUDED."UserBias",
+                            "UserFactors" = EXCLUDED."UserFactors";
+                        """
+                        psycopg2.extras.execute_batch(cur, sql_user, user_factor_data)
 
-            if item_factor_data:
-                sql_item = """
-                INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
-                    "ItemBias" = EXCLUDED."ItemBias",
-                    "ItemFactors" = EXCLUDED."ItemFactors";
-                """
-                psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
-                
-            cur = self.connection.cursor()
-            cur.execute("""
-                UPDATE "Model" SET "AverageRating"=%s WHERE "Id"=%s 
-            """, (float(self.mu), self.model_id))
-            
-            self.connection.commit()
-
+                    if item_factor_data:
+                        sql_item = """
+                        INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
+                            "ItemBias" = EXCLUDED."ItemBias",
+                            "ItemFactors" = EXCLUDED."ItemFactors";
+                        """
+                        psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
+                        
+                    cur.execute("""
+                        UPDATE "Model" SET "AverageRating"=%s WHERE "Id"=%s 
+                    """, (float(self.mu), self.model_id))
+                    
+                conn.commit()
         except Exception as e:
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")
-            self.connection.rollback()
 
+    # THAY ĐỔI: Tự mở và đóng kết nối để đọc Database
     def load_model_from_db(self, model_id):
-        cur = self.connection.cursor()
-        
         item_factors = {}
         item_biases = {}
         temp_k_from_factors = None
+        user_factors = {}
+        user_biases = {}
+        mu_val = 3.5
 
         try:
-            cur.execute("""
-                SELECT "ItemId", "ItemBias", "ItemFactors"
-                FROM "ItemFactor"
-                WHERE "ModelId" = %s
-                ORDER BY "ItemId"
-            """, (model_id,))
-            rows_items = cur.fetchall()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "ItemId", "ItemBias", "ItemFactors"
+                        FROM "ItemFactor"
+                        WHERE "ModelId" = %s
+                        ORDER BY "ItemId"
+                    """, (model_id,))
+                    rows_items = cur.fetchall()
+                    for item_id, bias, factors in rows_items:
+                        item_id = str(item_id)
+                        if item_id not in self.item2idx: continue
+                        
+                        if bias is not None and factors is not None:
+                            item_biases[item_id] = float(bias)
+                            item_factors[item_id] = np.array(factors, dtype=float)
+                            if temp_k_from_factors is None:
+                                temp_k_from_factors = len(item_factors[item_id])
+
+                    cur.execute("""
+                        SELECT "UserId", "UserBias", "UserFactors"
+                        FROM "UserFactor"
+                        WHERE "ModelId" = %s
+                        ORDER BY "UserId"
+                    """, (model_id,))
+                    rows_users = cur.fetchall()
+                    for user_id, bias, factors in rows_users:
+                        user_id = str(user_id)
+                        if user_id not in self.user2idx: continue
+                        if bias is not None and factors is not None:
+                            user_biases[user_id] = float(bias)
+                            user_factors[user_id] = np.array(factors, dtype=float)
+                            if self.k is None and len(user_factors[user_id]) > 0:
+                                self.k = len(user_factors[user_id])
+
+                    cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
+                    mu_row = cur.fetchone()
+                    if mu_row and mu_row[0] is not None:
+                        mu_val = float(mu_row[0])
         except Exception as e:
-            print(f"❌ Error loading items/factors: {e}")
+            print(f"❌ Error loading model state from DB: {e}")
             raise
-        
-        for item_id, bias, factors in rows_items:
-            item_id = str(item_id)
-            if item_id not in self.item2idx: continue
-            
-            if bias is not None and factors is not None:
-                item_biases[item_id] = float(bias)
-                item_factors[item_id] = np.array(factors, dtype=float)
-                if temp_k_from_factors is None:
-                    temp_k_from_factors = len(item_factors[item_id])
 
         if temp_k_from_factors is not None:
             self.k = temp_k_from_factors
             print(f"   Inferred K={self.k} from loaded item factors.")
-
-        user_factors = {}
-        user_biases = {}
-        try:
-            cur.execute("""
-                SELECT "UserId", "UserBias", "UserFactors"
-                FROM "UserFactor"
-                WHERE "ModelId" = %s
-                ORDER BY "UserId"
-            """, (model_id,))
-            rows_users = cur.fetchall()
-        except Exception as e:
-            print(f"❌ Error loading users/factors: {e}")
-            raise
-
-        for user_id, bias, factors in rows_users:
-            user_id = str(user_id)
-            if user_id not in self.user2idx: continue
-            if bias is not None and factors is not None:
-                user_biases[user_id] = float(bias)
-                user_factors[user_id] = np.array(factors, dtype=float)
-                if self.k is None and len(user_factors[user_id]) > 0:
-                    self.k = len(user_factors[user_id])
-
-        if self.k is None:
+        elif self.k is None:
              print("⚠️ Warning: Cannot determine K from loaded factors. Using default K.")
 
+        self.mu = mu_val
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
-        # Tạo mảng init. Nếu n_users_loaded=0 thì mảng sẽ có shape (0, k)
         P_init_arr = np.zeros((n_users_loaded, self.k), dtype=float)
         Q_init_arr = np.zeros((n_items_loaded, self.k), dtype=float)
         b_u_init_arr = np.zeros(n_users_loaded, dtype=float)
@@ -515,14 +520,6 @@ class LatentFactorModel(nn.Module):
             if item_id in item_biases:
                 b_i_init_arr[idx] = item_biases[item_id]
                 
-        cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
-        mu_row = cur.fetchone()
-        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3.5
-        
-        # Init model. Logic trong ReviewRatingModel sẽ check kích thước.
-        # Nếu n_users_loaded = 0 -> P_init_arr shape (0, k).
-        # Model ép n_users = 1 -> self.P shape (1, k).
-        # Shape lệch -> Dùng random init thay vì copy. -> KHÔNG CRASH.
         self.model = self.ReviewRatingModel(
             n_users_loaded, n_items_loaded, self.k, self.mu,
             P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr

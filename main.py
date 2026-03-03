@@ -22,7 +22,6 @@ except ImportError as e:
 DB_CONFIG = settings.DB_CONFIG
 MODEL_TYPES = ["PLA", "ReviewRating", "UEIE", "UCInit", "IInit 1", "IInit 2", "IInit 3", "IInit 4", "IInit 5", "IInit 6", "IInit 7", "IInit 8"]
 
-# Queue để xếp hàng
 training_queue = asyncio.Queue()
 
 class TrainRequest(BaseModel):
@@ -35,7 +34,6 @@ class TrainRequest(BaseModel):
     train_submodels: bool = True
 
 async def worker_process_queue():
-    """Hàm worker chạy nền để xử lý từng request trong queue"""
     print("👷 Queue Worker started waiting for tasks...")
     while True:
         task_args = await training_queue.get()
@@ -44,7 +42,6 @@ async def worker_process_queue():
         print(f"🔄 [Queue] Start processing Domain {domain_id}. Pending: {training_queue.qsize()}")
         
         try:
-            # Chạy hàm training trong thread riêng để không block API
             await asyncio.to_thread(
                 run_training_task,
                 task_args['domain_id'],
@@ -63,7 +60,6 @@ async def worker_process_queue():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Khởi động worker khi app start
     worker_task = asyncio.create_task(worker_process_queue())
     print("🚀 System started.")
     yield
@@ -73,7 +69,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Recommender Training API", lifespan=lifespan)
 
 def ensure_models_exist(cursor, domain_id):
-    """Tìm hoặc tạo ID cho bộ model của Domain."""
     model_ids = {}
     for name in MODEL_TYPES:
         cursor.execute('SELECT "Id" FROM "Model" WHERE "DomainId" = %s AND "Name" = %s LIMIT 1', (domain_id, name))
@@ -89,16 +84,13 @@ def ensure_models_exist(cursor, domain_id):
             model_ids[name] = cursor.fetchone()[0]
     return model_ids
 
-def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, save, conn, interaction_type_id=0):
-    """
-    Hàm train sub-model nhận conn từ bên ngoài truyền vào.
-    """
+# THAY ĐỔI: Truyền db_config thay vì conn
+def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, save, db_config, interaction_type_id=0):
     print(f"\n⚡ Bắt đầu train sub-model: {name} (ID: {model_id})...")
     
-    # Khởi tạo model với connection được truyền vào
     if "iinit" in name.lower():
         model = ModelClass(
-            connection=conn,
+            db_config=db_config, # ĐỔI Ở ĐÂY
             domain_id=domain_id,
             model_id=model_id,
             k=90,
@@ -107,7 +99,7 @@ def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, s
         )
     else:
         model = ModelClass(
-            connection=conn,
+            db_config=db_config, # ĐỔI Ở ĐÂY
             domain_id=domain_id,
             model_id=model_id,
             k=90,
@@ -122,65 +114,53 @@ def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, s
     print(f"✅ Đã xong {name}.")
 
 def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, train_submodels):
-    """
-    Hàm thực thi chính. 
-    QUAN TRỌNG: Quản lý vòng đời kết nối DB chặt chẽ (Open -> Train -> Close).
-    """
-    print(f"🔌 [Domain {domain_id}] Opening FRESH DB connection...")
-    conn = None
+    print(f"🔌 [Domain {domain_id}] Initializing models...")
     
+    # 1. Chỉ mở kết nối NHANH để lấy Model IDs
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                model_map = ensure_models_exist(cur, domain_id)
+            conn.commit()
+    except Exception as e:
+        print(f"❌ [Domain {domain_id}] Error ensuring models: {e}")
+        return
+
+    print(f"ℹ️ [Domain {domain_id}] Context: {model_map}")
+
+    try:
+        if train_submodels:
+            # Truyền DB_CONFIG vào thay vì conn
+            train_sub_model(ReviewRatingModel, "ReviewRating", domain_id, model_map["ReviewRating"], epochs, batch_size, save, DB_CONFIG)
+            train_sub_model(UEIEModel, "UEIE", domain_id, model_map["UEIE"], epochs, batch_size, save, DB_CONFIG)
+            train_sub_model(UCInitModel, "UCInit", domain_id, model_map["UCInit"], epochs, batch_size, save, DB_CONFIG)
+            for i in range(1, 9):
+                train_sub_model(IInitModel, f"IInit {i}", domain_id, model_map[f"IInit {i}"], epochs, batch_size, save, DB_CONFIG, interaction_type_id=i)
+
+        print(f"\n🚀 [Domain {domain_id}] Training PLA...")
+        pla = PLA(
+            db_config=DB_CONFIG, # ĐỔI Ở ĐÂY
+            domain_id=domain_id,
+            model_ids_map=model_map,
+            k=90,
+            train_mode='train'
+        )
         
-        try:
-            cur = conn.cursor()
-            model_map = ensure_models_exist(cur, domain_id)
-            conn.commit()
-            print(f"ℹ️ [Domain {domain_id}] Context: {model_map}")
-
-            if train_submodels:
-                train_sub_model(ReviewRatingModel, "ReviewRating", domain_id, model_map["ReviewRating"], epochs, batch_size, save, conn)
-                train_sub_model(UEIEModel, "UEIE", domain_id, model_map["UEIE"], epochs, batch_size, save, conn)
-                train_sub_model(UCInitModel, "UCInit", domain_id, model_map["UCInit"], epochs, batch_size, save, conn)
-                for i in range(1, 9):
-                    train_sub_model(IInitModel, f"IInit {i}", domain_id, model_map[f"IInit {i}"], epochs, batch_size, save, conn, interaction_type_id=i)
-
-            print(f"\n🚀 [Domain {domain_id}] Training PLA...")
-            pla = PLA(
-                connection=conn,
-                domain_id=domain_id,
-                model_ids_map=model_map,
-                k=90,
-                train_mode='train'
-            )
-            
-            pla.fit(n_epochs=pla_epochs, batch_size=batch_size, tol=tol)
-            
-            if save:
-                print(f"💾 [Domain {domain_id}] Saving PLA theta...")
-                pla.write_model_to_db()
-            
-            conn.commit()
-            print(f"\n🎉 [Domain {domain_id}] TRAINING SUCCESSFUL! 🎉")
-
-        except Exception as inner_e:
-            if conn:
-                conn.rollback()
-            raise inner_e
+        pla.fit(n_epochs=pla_epochs, batch_size=batch_size, tol=tol)
+        
+        if save:
+            print(f"💾 [Domain {domain_id}] Saving PLA theta...")
+            pla.write_model_to_db()
+        
+        print(f"\n🎉 [Domain {domain_id}] TRAINING SUCCESSFUL! 🎉")
 
     except Exception as e:
         print(f"❌ [Domain {domain_id}] CRITICAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        
-    finally:
-        if conn is not None:
-            conn.close()
-            print(f"🔌 [Domain {domain_id}] DB Connection CLOSED properly.")
 
 @app.post("/api/train", status_code=202)
 async def trigger_training(req: TrainRequest):
-    # Đẩy vào queue
     await training_queue.put({
         'domain_id': req.domain_id,
         'epochs': req.epochs,

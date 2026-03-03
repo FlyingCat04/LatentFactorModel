@@ -16,7 +16,7 @@ class LatentFactorModel(nn.Module):
         self,
         ratings=None, 
         items=None,
-        connection=None, 
+        db_config=None, # THAY ĐỔI: Nhận db_config
         k=90,
         lam=0.01,
         lr=0.001,
@@ -30,7 +30,7 @@ class LatentFactorModel(nn.Module):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        self.connection = connection
+        self.db_config = db_config # THAY ĐỔI
         self.lam = lam
         self.lr = lr
         self.p = p
@@ -43,10 +43,10 @@ class LatentFactorModel(nn.Module):
         self.domain_id = domain_id
         
         # --- Handle requirements safely ---
-        if self.connection is None and self.train_mode == 'train' and (ratings is None or items is None):
-            raise ValueError("❌ DB connection or ratings/items required for training.")
-        if self.connection is None and self.train_mode == 'load':
-            raise ValueError("❌ DB connection required for loading model.")
+        if self.db_config is None and self.train_mode == 'train' and (ratings is None or items is None):
+            raise ValueError("❌ DB config or ratings/items required for training.")
+        if self.db_config is None and self.train_mode == 'load':
+            raise ValueError("❌ DB config required for loading model.")
         if self.train_mode not in ['train', 'load']:
             raise ValueError("❌ train_mode must be 'train' or 'load'")
         
@@ -82,13 +82,11 @@ class LatentFactorModel(nn.Module):
             if not self.ratings:
                 print("⚠️ Warning: No training ratings available. Initializing with Random Weights.")
                 self.mu = 3.5
-                # Initialize random weights since we can't do UCInit logic without data
                 P_init_arr = np.random.normal(scale=0.01, size=(self.n_users, self.k))
                 Q_init_arr = np.random.normal(scale=0.01, size=(self.n_items, self.k))
                 b_u_init_arr = np.zeros(self.n_users)
                 b_i_init_arr = np.zeros(self.n_items)
             else:
-                # Filter ratings
                 original_count = len(self.ratings)
                 self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
                 filtered = original_count - len(self.ratings)
@@ -97,7 +95,6 @@ class LatentFactorModel(nn.Module):
                 
                 self.ratings_dict = {(u, i): r for u, i, r in self.ratings}
                 
-                # Check again after filtering
                 if not self.ratings:
                      print("⚠️ All ratings filtered out. Using Random Init.")
                      self.mu = 3.5
@@ -106,7 +103,6 @@ class LatentFactorModel(nn.Module):
                      b_u_init_arr = np.zeros(self.n_users)
                      b_i_init_arr = np.zeros(self.n_items)
                 else:
-                    # Perform UCInit Logic
                     self.load_item_categories()
                     self.mu = np.mean([r for _, _, r in self.ratings])
                     self.top_p_users = self._get_top_p_users()
@@ -120,7 +116,6 @@ class LatentFactorModel(nn.Module):
                     b_i_init_arr = np.array([b_i_map[i] for i in self.items_list])
 
             # 4. Create Model
-            # Ensure n_users/n_items at least 1 to avoid Embedding crash
             self.model = self.UCInitModel(
                 max(self.n_users, 1), max(self.n_items, 1), self.k, self.mu, 
                 P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr
@@ -143,7 +138,6 @@ class LatentFactorModel(nn.Module):
             self.mu = mu
 
             with torch.no_grad():
-                # Safe copy even if shapes slightly mismatch due to fallback
                 if P_init is not None and P_init.shape == self.P.weight.shape:
                     self.P.weight.copy_(torch.tensor(P_init, dtype=torch.float32))
                 else:
@@ -172,134 +166,107 @@ class LatentFactorModel(nn.Module):
             dot_product = (p_u * q_i).sum(dim=1)
             return self.mu + b_u + b_i + dot_product
     
+    # THAY ĐỔI: Quản lý Connection
     def load_user_item_from_db(self):
-        cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "Id"
-                From "User"
-                WHERE "DomainId" = %s
-                ORDER BY "Id"
-            """, (self.domain_id,))
-            rows = cur.fetchall()
-            self.users = [str(row[0]) for row in rows]
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.users = [str(row[0]) for row in cur.fetchall()]
+                    
+                    cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.items_list = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
-            print(f"⚠️ Error loading users: {e}")
+            print(f"⚠️ Error loading users/items: {e}")
             self.users = []
-        
-        try:
-            cur.execute("""
-                SELECT "Id"
-                From "Item"
-                WHERE "DomainId" = %s
-                ORDER BY "Id"
-            """, (self.domain_id,))
-            rows = cur.fetchall()
-            self.items_list = [str(row[0]) for row in rows]
-        except Exception as e:
-            print(f"⚠️ Error loading items: {e}")
             self.items_list = []
     
+    # THAY ĐỔI: Quản lý Connection
     def load_item_categories(self):
-        cur = self.connection.cursor()
-        
         category_name = {}
-        try:
-            cur.execute('SELECT * FROM "Category"')
-            rows = cur.fetchall()
-            for row in rows:
-                category_name[row[0]] = row[1]
-        except Exception:
-            pass
-        
         self.item_categories = defaultdict(list)
-        if not self.items_list: return
+        
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT * FROM "Category"')
+                    rows = cur.fetchall()
+                    for row in rows:
+                        category_name[row[0]] = row[1]
+                    
+                    if not self.items_list: return
 
-        chunk_size = 1000
-        # Safe conversion to int
-        items_int = []
-        for x in self.items_list:
-            try: items_int.append(int(x))
-            except: pass
-            
-        for i in range(0, len(items_int), chunk_size):
-            chunk = items_int[i:i+chunk_size]
-            if not chunk: continue
-            try:
-                cur.execute(
-                    'SELECT "ItemId", "CategoryId" FROM "ItemCategory" WHERE "ItemId" = ANY(%s)',
-                    (chunk,)
-                )
-                rows = cur.fetchall()
-                for iid, cid in rows:
-                    if cid in category_name:
-                        self.item_categories[str(iid)].append(category_name[cid])
-            except Exception:
-                continue
+                    chunk_size = 1000
+                    items_int = []
+                    for x in self.items_list:
+                        try: items_int.append(int(x))
+                        except: pass
+                        
+                    for i in range(0, len(items_int), chunk_size):
+                        chunk = items_int[i:i+chunk_size]
+                        if not chunk: continue
+                        cur.execute(
+                            'SELECT "ItemId", "CategoryId" FROM "ItemCategory" WHERE "ItemId" = ANY(%s)',
+                            (chunk,)
+                        )
+                        rows = cur.fetchall()
+                        for iid, cid in rows:
+                            if cid in category_name:
+                                self.item_categories[str(iid)].append(category_name[cid])
+        except Exception as e:
+            print(f"⚠️ Error loading item categories: {e}")
         
+    # THAY ĐỔI: Quản lý Connection
     def load_model_from_db(self, model_id):
-        cur = self.connection.cursor()
-        
         item_factors = {}
         item_biases = {}
         temp_k_from_factors = None
+        user_factors = {}
+        user_biases = {}
+        mu_val = 3.5
 
         try:
-            cur.execute("""
-                SELECT "ItemId", "ItemBias", "ItemFactors"
-                FROM "ItemFactor"
-                WHERE "ModelId" = %s
-                ORDER BY "ItemId"
-            """, (model_id,))
-            rows_items = cur.fetchall()
-        except Exception as e:
-            print(f"❌ Error loading items/factors: {e}")
-            raise
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT "ItemId", "ItemBias", "ItemFactors" FROM "ItemFactor" WHERE "ModelId" = %s ORDER BY "ItemId"', (model_id,))
+                    rows_items = cur.fetchall()
+                    for item_id, bias, factors in rows_items:
+                        item_id = str(item_id)
+                        if item_id not in self.item2idx:
+                            continue
+                        if bias is not None and factors is not None:
+                            item_biases[item_id] = float(bias)
+                            item_factors[item_id] = np.array(factors, dtype=float)
+                            if temp_k_from_factors is None:
+                                temp_k_from_factors = len(item_factors[item_id])
 
-        for item_id, bias, factors in rows_items:
-            item_id = str(item_id)
-            if item_id not in self.item2idx:
-                continue
-            
-            if bias is not None and factors is not None:
-                item_biases[item_id] = float(bias)
-                item_factors[item_id] = np.array(factors, dtype=float)
-                if temp_k_from_factors is None:
-                    temp_k_from_factors = len(item_factors[item_id])
+                    cur.execute('SELECT "UserId", "UserBias", "UserFactors" FROM "UserFactor" WHERE "ModelId" = %s ORDER BY "UserId"', (model_id,))
+                    rows_users = cur.fetchall()
+                    for user_id, bias, factors in rows_users:
+                        user_id = str(user_id)
+                        if user_id not in self.user2idx:
+                            continue
+                        if bias is not None and factors is not None:
+                            user_biases[user_id] = float(bias)
+                            user_factors[user_id] = np.array(factors, dtype=float)
+                            if self.k is None and len(user_factors[user_id]) > 0:
+                                self.k = len(user_factors[user_id])
+
+                    cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
+                    mu_row = cur.fetchone()
+                    if mu_row and mu_row[0] is not None:
+                        mu_val = float(mu_row[0])
+        except Exception as e:
+            print(f"❌ Error loading factors from DB: {e}")
+            raise
 
         if temp_k_from_factors is not None:
             self.k = temp_k_from_factors
             print(f"   Inferred K={self.k} from loaded item factors.")
-
-        user_factors = {}
-        user_biases = {}
-        try:
-            cur.execute("""
-                SELECT "UserId", "UserBias", "UserFactors"
-                FROM "UserFactor"
-                WHERE "ModelId" = %s
-                ORDER BY "UserId"
-            """, (model_id,))
-            rows_users = cur.fetchall()
-        except Exception as e:
-            print(f"❌ Error loading users/factors: {e}")
-            raise
-
-        for user_id, bias, factors in rows_users:
-            user_id = str(user_id)
-            if user_id not in self.user2idx:
-                continue
-            
-            if bias is not None and factors is not None:
-                user_biases[user_id] = float(bias)
-                user_factors[user_id] = np.array(factors, dtype=float)
-                if self.k is None and len(user_factors[user_id]) > 0:
-                    self.k = len(user_factors[user_id])
-                    print(f" Inferred K={self.k} from loaded user factors.")
-
-        if self.k is None:
+        elif self.k is None:
             print("⚠️ Warning: Cannot determine K from loaded factors. Using default.")
 
+        self.mu = mu_val
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
@@ -320,10 +287,6 @@ class LatentFactorModel(nn.Module):
             if item_id in item_biases:
                 b_i_init_arr[idx] = item_biases[item_id]
                 
-        cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
-        mu_row = cur.fetchone()
-        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3.5
-        
         self.model = self.UCInitModel(
             max(n_users_loaded, 1), max(n_items_loaded, 1), self.k, self.mu,
             P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr
@@ -348,6 +311,7 @@ class LatentFactorModel(nn.Module):
         try:
             item_to_cat_string = {item: ",".join(self.item_categories[item]) for item in items}
         except TypeError:
+            print("⚠️ Warning: TypeError during category join. Using empty strings.")
             item_to_cat_string = {
                 item: ",".join(self.item_categories[item]) if self.item_categories[item] else ""
                 for item in items
@@ -356,12 +320,12 @@ class LatentFactorModel(nn.Module):
         categories = sorted(list(set(item_to_cat_string.values())))
         n_categories = len(categories)
         if n_categories == 0:
+            print("⚠️ Warning: No categories found. Returning random users.")
             shuffled_users = list(self.users)
             np.random.shuffle(shuffled_users)
             return shuffled_users[:self.v]
             
         cat_to_idx = {cat: idx for idx, cat in enumerate(categories)}
-
         item_to_cat_idx = {item: cat_to_idx[cat_str] for item, cat_str in item_to_cat_string.items()}
 
         category_totals = np.zeros(n_categories, dtype=int)
@@ -384,7 +348,6 @@ class LatentFactorModel(nn.Module):
 
         for u_idx, user in enumerate(self.users):
             rated_row = user_rated_counts[u_idx, :]
-            
             not_rated_row = category_totals - rated_row
 
             contingency_table[0, :] = rated_row
@@ -417,7 +380,6 @@ class LatentFactorModel(nn.Module):
         R_top = R[top_v_idx, :].toarray()
         Q_init_matrix = R_top.T
 
-        # Nếu số lượng top_v_users < k, cần pad thêm columns
         if Q_init_matrix.shape[1] < self.k:
             padding = np.zeros((Q_init_matrix.shape[0], self.k - Q_init_matrix.shape[1]), dtype=np.float32)
             Q_init_matrix = np.hstack([Q_init_matrix, padding])
@@ -520,16 +482,18 @@ class LatentFactorModel(nn.Module):
 
         print("🏁 Training finished.")
 
+    # THAY ĐỔI: Quản lý Connection
     def load_ratings_from_db(self, limit_total=1000000, ratio=1):
-        cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "UserId", "ItemId", "Value"
-                FROM "Rating"
-                WHERE "DomainId" = %s AND "Value" IS NOT NULL
-                LIMIT %s
-            """, (self.domain_id, limit_total))
-            rows = cur.fetchall()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "UserId", "ItemId", "Value"
+                        FROM "Rating"
+                        WHERE "DomainId" = %s AND "Value" IS NOT NULL
+                        LIMIT %s
+                    """, (self.domain_id, limit_total))
+                    rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
             rows = []
@@ -554,98 +518,96 @@ class LatentFactorModel(nn.Module):
         self.ratings = [(str(u), str(i), float(r)) for u, i, r in rows[:train_count]]
         self.test_ratings = [(str(u), str(i), float(r)) for u, i, r in rows[train_count:]]
     
+    # THAY ĐỔI: Mở Database connection duy nhất lúc lưu data
     def write_model_to_db(self):
         if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
-        if self.connection is None: raise ValueError("❌ DB connection required.")
+        if self.db_config is None: raise ValueError("❌ DB config required.")
         if self.model is None: print("⚠️ Model not trained. Cannot save."); return
 
-        cur = self.connection.cursor()
         self.model.eval()
 
-        try:
-            with torch.no_grad():
-                all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
-                all_user_factors = self.model.P.weight.cpu().numpy()
-                all_item_biases = self.model.b_i.weight.squeeze().cpu().numpy()
-                all_item_factors = self.model.Q.weight.cpu().numpy()
+        with torch.no_grad():
+            all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
+            all_user_factors = self.model.P.weight.cpu().numpy()
+            all_item_biases = self.model.b_i.weight.squeeze().cpu().numpy()
+            all_item_factors = self.model.Q.weight.cpu().numpy()
 
-            user_factor_data = []
-            item_factor_data = []
-            
-            # Use ratings to determine "seen" vs "unseen" logic (if any)
-            users_in_train = set(u for u, _, _ in self.ratings)
-            items_in_train = set(i for _, i, _ in self.ratings)
+        user_factor_data = []
+        item_factor_data = []
+        
+        users_in_train = set(u for u, _, _ in self.ratings) if self.ratings else set()
+        items_in_train = set(i for _, i, _ in self.ratings) if self.ratings else set()
 
-            for user_id in self.users:
-                if user_id in users_in_train:
-                    idx = self.user2idx[user_id]
+        for user_id in self.users:
+            if user_id in users_in_train:
+                idx = self.user2idx[user_id]
+                user_factor_data.append((
+                    user_id,
+                    float(all_user_biases[idx]),
+                    all_user_factors[idx].tolist(),
+                    self.model_id
+                ))
+            else:
+                idx = self.user2idx.get(user_id)
+                if idx is not None:
                     user_factor_data.append((
                         user_id,
-                        float(all_user_biases[idx]),
+                        0.0,
                         all_user_factors[idx].tolist(),
                         self.model_id
                     ))
-                else:
-                    # Save initialized factors even if no ratings
-                    idx = self.user2idx.get(user_id)
-                    if idx is not None:
-                        user_factor_data.append((
-                            user_id,
-                            0.0,
-                            all_user_factors[idx].tolist(),
-                            self.model_id
-                        ))
-            
-            for item_id in self.items_list:
-                if item_id in items_in_train:
-                    idx = self.item2idx[item_id]
+        
+        for item_id in self.items_list:
+            if item_id in items_in_train:
+                idx = self.item2idx[item_id]
+                item_factor_data.append((
+                    item_id,
+                    float(all_item_biases[idx]),
+                    all_item_factors[idx].tolist(),
+                    self.model_id
+                ))
+            else:
+                idx = self.item2idx.get(item_id)
+                if idx is not None:
                     item_factor_data.append((
                         item_id,
-                        float(all_item_biases[idx]),
+                        0.0,
                         all_item_factors[idx].tolist(),
                         self.model_id
                     ))
-                else:
-                    idx = self.item2idx.get(item_id)
-                    if idx is not None:
-                        item_factor_data.append((
-                            item_id,
-                            0.0,
-                            all_item_factors[idx].tolist(),
-                            self.model_id
-                        ))
 
-            if user_factor_data:
-                sql_user = """
-                INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
-                    "UserBias" = EXCLUDED."UserBias",
-                    "UserFactors" = EXCLUDED."UserFactors";
-                """
-                psycopg2.extras.execute_batch(cur, sql_user, user_factor_data)
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    if user_factor_data:
+                        sql_user = """
+                        INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
+                            "UserBias" = EXCLUDED."UserBias",
+                            "UserFactors" = EXCLUDED."UserFactors";
+                        """
+                        psycopg2.extras.execute_batch(cur, sql_user, user_factor_data)
 
-            if item_factor_data:
-                sql_item = """
-                INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
-                    "ItemBias" = EXCLUDED."ItemBias",
-                    "ItemFactors" = EXCLUDED."ItemFactors";
-                """
-                psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
-                
-            cur = self.connection.cursor()
-            cur.execute("""
-                UPDATE "Model" SET "AverageRating"=%s WHERE "Id"=%s 
-            """, (float(self.mu), self.model_id))
-            
-            self.connection.commit()
-            print(f"✅ Saved model factors (Users: {len(user_factor_data)}, Items: {len(item_factor_data)})")
+                    if item_factor_data:
+                        sql_item = """
+                        INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
+                            "ItemBias" = EXCLUDED."ItemBias",
+                            "ItemFactors" = EXCLUDED."ItemFactors";
+                        """
+                        psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
+                        
+                    cur.execute("""
+                        UPDATE "Model" SET "AverageRating"=%s WHERE "Id"=%s 
+                    """, (float(self.mu), self.model_id))
+                    
+                conn.commit()
+                print(f"✅ Saved model factors (Users: {len(user_factor_data)}, Items: {len(item_factor_data)})")
 
         except Exception as e:
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")
-            self.connection.rollback()
             
     def predict(self, user, item, p):
         if self.model is None:

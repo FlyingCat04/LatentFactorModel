@@ -21,7 +21,7 @@ except ImportError:
 class PLA(nn.Module):
     def __init__(
         self,
-        connection=None, 
+        db_config=None, # THAY ĐỔI: Nhận db_config
         domain_id=None,       
         model_ids_map=None,
         k=90,
@@ -36,7 +36,7 @@ class PLA(nn.Module):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        self.connection = connection
+        self.db_config = db_config # THAY ĐỔI
         self.domain_id = domain_id
         self.ratings = [] # Initialize as empty list
         self.test_ratings = None
@@ -49,8 +49,8 @@ class PLA(nn.Module):
         self.train_mode = train_mode.lower()
         self.model_ids_map = model_ids_map
         
-        if self.connection is None:
-            raise ValueError("❌ DB connection required.")
+        if self.db_config is None:
+            raise ValueError("❌ DB config required.")
         if self.domain_id is None:
             raise ValueError("❌ 'domain_id' is required.")
         if model_ids_map is None:
@@ -59,7 +59,7 @@ class PLA(nn.Module):
         # --- Load Sub-models ---
         print("--- Loading Sub-models for PLA ---")
         self.review_model = ReviewModel(
-            connection=self.connection,
+            db_config=self.db_config, # THAY ĐỔI
             train_mode='load',
             model_id=model_ids_map["ReviewRating"],
             domain_id=self.domain_id,
@@ -69,7 +69,7 @@ class PLA(nn.Module):
             weight=0.3
         )
         self.ueie_model = UEIEModel(
-            connection=self.connection,
+            db_config=self.db_config, # THAY ĐỔI
             train_mode='load',
             model_id=model_ids_map["UEIE"],
             domain_id=self.domain_id,
@@ -79,7 +79,7 @@ class PLA(nn.Module):
             weight=0.3
         )
         self.ucinit_model = UCInitModel(
-            connection=self.connection,
+            db_config=self.db_config, # THAY ĐỔI
             train_mode='load',
             model_id=model_ids_map["UCInit"],
             domain_id=self.domain_id,
@@ -93,7 +93,7 @@ class PLA(nn.Module):
         for i in range(1, 9):
             try:
                 self.iinit_models[i] = IInitModel(
-                    connection=self.connection,
+                    db_config=self.db_config, # THAY ĐỔI
                     train_mode='load',
                     model_id=model_ids_map[f"IInit {i}"],
                     domain_id=self.domain_id,
@@ -132,68 +132,77 @@ class PLA(nn.Module):
             self.load_ratings_from_db()
             if not self.ratings:
                 print("⚠️ Warning: No training ratings found for PLA. Model will rely on initial Theta/Random weights.")
-                # We do NOT raise ValueError here. We just proceed.
 
+    # THAY ĐỔI: Tự mở connection
     def load_user_item_from_db(self):
-        cur = self.connection.cursor()
-        try: 
-            cur.execute('SELECT "Id" FROM "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
-            self.users = [str(row[0]) for row in cur.fetchall()]
-            
-            cur.execute('SELECT "Id" FROM "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
-            self.items = [str(row[0]) for row in cur.fetchall()]
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT "Id" FROM "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.users = [str(row[0]) for row in cur.fetchall()]
+                    
+                    cur.execute('SELECT "Id" FROM "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.items = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
             print(f"❌ Error querying users/items: {e}")
             self.users = []
             self.items = []
 
+    # THAY ĐỔI: Tự mở connection
     def load_theta_from_db(self):
-        cursor = self.connection.cursor()
         model_order_names = ["ReviewRating", "UEIE", "UCInit", "IInit 1", "IInit 2", "IInit 3", "IInit 4", "IInit 5", "IInit 6", "IInit 7", "IInit 8"]
         thetas = []
         expected_dim = 2 * self.k
 
         print("--- Loading Theta from DB ---")
-        for name in model_order_names:
-            mid = self.model_ids_map.get(name)
-            if mid:
-                cursor.execute('SELECT "LearnableParameters" FROM "Model" WHERE "Id" = %s', (mid,))
-                result = cursor.fetchone()
-            else:
-                result = None
-            
-            # Initialize random small noise
-            arr = np.random.randn(expected_dim).astype(np.float32) * 0.1
-            status = "🆕 NULL/Empty -> Random Init"
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cursor:
+                    for name in model_order_names:
+                        mid = self.model_ids_map.get(name)
+                        if mid:
+                            cursor.execute('SELECT "LearnableParameters" FROM "Model" WHERE "Id" = %s', (mid,))
+                            result = cursor.fetchone()
+                        else:
+                            result = None
+                        
+                        # Initialize random small noise
+                        arr = np.random.randn(expected_dim).astype(np.float32) * 0.1
+                        status = "🆕 NULL/Empty -> Random Init"
 
-            if result and result[0] is not None:
-                try:
-                    db_arr = np.array(result[0], dtype=np.float32)
-                    if db_arr.size == expected_dim:
-                        arr = db_arr
-                        status = "✅ Loaded"
-                    else:
-                        status = f"⚠️ Size Mismatch ({db_arr.size} vs {expected_dim}) -> Re-init"
-                except Exception:
-                    status = "❌ Parse Error -> Re-init"
-            
-            # print(f"   - {name} (ID {mid}): {status}")
-            thetas.append(arr)
+                        if result and result[0] is not None:
+                            try:
+                                db_arr = np.array(result[0], dtype=np.float32)
+                                if db_arr.size == expected_dim:
+                                    arr = db_arr
+                                    status = "✅ Loaded"
+                                else:
+                                    status = f"⚠️ Size Mismatch ({db_arr.size} vs {expected_dim}) -> Re-init"
+                            except Exception:
+                                status = "❌ Parse Error -> Re-init"
+                        
+                        # print(f"   - {name} (ID {mid}): {status}")
+                        thetas.append(arr)
+        except Exception as e:
+            print(f"❌ DB Connection Error loading theta: {e}. Generating random thetas.")
+            thetas = [np.random.randn(expected_dim).astype(np.float32) * 0.1 for _ in model_order_names]
 
         theta_matrix = np.stack(thetas, axis=0)
         self.theta = nn.Parameter(torch.tensor(theta_matrix, dtype=torch.float32, device=self.device))
         print(f"✅ Theta loaded. Shape: {self.theta.shape}")
 
+    # THAY ĐỔI: Tự mở connection
     def load_ratings_from_db(self, limit_total=1000000):
-        cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "UserId", "ItemId", "Value"
-                FROM "Rating"
-                WHERE "DomainId" = %s AND "Value" IS NOT NULL
-                LIMIT %s
-            """, (self.domain_id, limit_total))
-            rows = cur.fetchall()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "UserId", "ItemId", "Value"
+                        FROM "Rating"
+                        WHERE "DomainId" = %s AND "Value" IS NOT NULL
+                        LIMIT %s
+                    """, (self.domain_id, limit_total))
+                    rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
             rows = []
@@ -205,7 +214,6 @@ class PLA(nn.Module):
 
         all_ratings = [(str(u), str(i), float(r)) for u, i, r in rows]
         
-        # --- FILTERING LOGIC ---
         valid_users = set(self.users)
         valid_items = set(self.items)
         
@@ -222,18 +230,16 @@ class PLA(nn.Module):
 
     def forward(self, u, i):
         # ---- 1. Get phi(u, i) from Review Model (Base) ----
-        # Nếu user/item không có trong Review Model, dùng vector 0 hoặc random
         u_idx = self.review_model.user2idx.get(u)
         i_idx = self.review_model.item2idx.get(i)
         
         if u_idx is not None:
-            # Check range to prevent index out of bounds if model mismatch
             if u_idx < self.review_model.model.P.num_embeddings:
                 Pu = self.review_model.model.P(torch.tensor([u_idx], device=self.device)).squeeze(0)
             else:
                  Pu = torch.zeros(self.k, device=self.device)
         else:
-            Pu = torch.zeros(self.k, device=self.device) # Fallback
+            Pu = torch.zeros(self.k, device=self.device) 
 
         if i_idx is not None:
             if i_idx < self.review_model.model.Q.num_embeddings:
@@ -241,7 +247,7 @@ class PLA(nn.Module):
             else:
                 Qi = torch.zeros(self.k, device=self.device)
         else:
-            Qi = torch.zeros(self.k, device=self.device) # Fallback
+            Qi = torch.zeros(self.k, device=self.device) 
             
         phi = torch.cat([Pu, Qi], dim=-1)   # shape [2k]
 
@@ -253,12 +259,11 @@ class PLA(nn.Module):
             try:
                 if model is None: return self.ucinit_model.mu
                 val = model.predict(u, i, 0)
-                # Ensure it returns a scalar float
                 if isinstance(val, (np.ndarray, list, torch.Tensor)):
                     val = float(val)
                 return val
             except Exception:
-                return self.ucinit_model.mu # Fallback to mean
+                return self.ucinit_model.mu 
 
         # 3 Main Models
         preds.append(torch.tensor(safe_predict(self.review_model), dtype=torch.float32, device=self.device))
@@ -359,13 +364,13 @@ class PLA(nn.Module):
         print("✅ Training finished!")
         self.save_predictions_to_db() 
         
+    # THAY ĐỔI: Chỉ mở kết nối khi thực sự cần INSERT Batch
     def save_predictions_to_db(self):
         """
         Calculates predictions for ALL users and items and saves to DB using Batch Insert.
         """
-        if self.connection is None: return
+        if self.db_config is None: return
         print("💾 Saving all predictions to DB (Batch Processing)...")
-        cur = self.connection.cursor()
         
         batch_data = []
         batch_size = 2000 
@@ -381,26 +386,38 @@ class PLA(nn.Module):
                         batch_data.append((u, i, val))
                         
                         if len(batch_data) >= batch_size:
+                            # Mở kết nối ngắn hạn để insert
+                            try:
+                                with psycopg2.connect(**self.db_config) as conn:
+                                    with conn.cursor() as cur:
+                                        query = """
+                                            INSERT INTO "Predict" ("UserId", "ItemId", "Value")
+                                            VALUES %s
+                                            ON CONFLICT ("UserId", "ItemId") DO UPDATE SET "Value" = EXCLUDED."Value";
+                                        """
+                                        psycopg2.extras.execute_values(cur, query, batch_data)
+                                        conn.commit()
+                            except Exception as e:
+                                print(f"❌ Error saving prediction batch: {e}")
+                            batch_data = [] # Reset batch
+                    except Exception:
+                        continue
+            
+            # Insert phần còn lại (nếu có)
+            if batch_data:
+                try:
+                    with psycopg2.connect(**self.db_config) as conn:
+                        with conn.cursor() as cur:
                             query = """
                                 INSERT INTO "Predict" ("UserId", "ItemId", "Value")
                                 VALUES %s
                                 ON CONFLICT ("UserId", "ItemId") DO UPDATE SET "Value" = EXCLUDED."Value";
                             """
                             psycopg2.extras.execute_values(cur, query, batch_data)
-                            self.connection.commit()
-                            batch_data = []
-                    except Exception:
-                        continue
-            
-            # Insert remaining
-            if batch_data:
-                query = """
-                    INSERT INTO "Predict" ("UserId", "ItemId", "Value")
-                    VALUES %s
-                    ON CONFLICT ("UserId", "ItemId") DO UPDATE SET "Value" = EXCLUDED."Value";
-                """
-                psycopg2.extras.execute_values(cur, query, batch_data)
-                self.connection.commit()
+                            conn.commit()
+                except Exception as e:
+                    print(f"❌ Error saving final prediction batch: {e}")
+                    
         print("✅ Done saving predictions.")
     
     def predict(self, user, item, p):
@@ -410,9 +427,9 @@ class PLA(nn.Module):
             r_hat, _, _ = self.forward(user, item)
             return r_hat.item()
 
+    # THAY ĐỔI: Tự mở connection
     def write_model_to_db(self):
-        if self.connection is None: return
-        cur = self.connection.cursor()
+        if self.db_config is None: return
         self.eval()
 
         theta_values = self.theta.detach().cpu().numpy() 
@@ -427,12 +444,11 @@ class PLA(nn.Module):
 
         try:
             if data_to_insert:
-                query = 'UPDATE "Model" SET "LearnableParameters" = %s, "ModifiedAt" = NOW() WHERE "Id" = %s;'
-                psycopg2.extras.execute_batch(cur, query, data_to_insert)
-                self.connection.commit()
-                print(f"💾 Saved {len(data_to_insert)} theta vectors to DB.")
+                with psycopg2.connect(**self.db_config) as conn:
+                    with conn.cursor() as cur:
+                        query = 'UPDATE "Model" SET "LearnableParameters" = %s, "ModifiedAt" = NOW() WHERE "Id" = %s;'
+                        psycopg2.extras.execute_batch(cur, query, data_to_insert)
+                        conn.commit()
+                        print(f"💾 Saved {len(data_to_insert)} theta vectors to DB.")
         except Exception as e:
-            print(f"❌ Error saving model: {e}")
-            self.connection.rollback()
-        finally:
-            cur.close()
+            print(f"❌ Error saving model thetas: {e}")

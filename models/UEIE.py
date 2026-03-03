@@ -13,7 +13,7 @@ from tqdm import tqdm
 class LatentFactorModel(nn.Module):
     def __init__(
         self,
-        connection,
+        db_config=None, # THAY ĐỔI: Nhận db_config thay vì connection
         ratings=None, 
         items=None,
         k=90,
@@ -28,7 +28,8 @@ class LatentFactorModel(nn.Module):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
-        self.connection = connection
+        
+        self.db_config = db_config # THAY ĐỔI
         self.weight = weight
         self.lam = lam
         self.lr = lr
@@ -51,10 +52,10 @@ class LatentFactorModel(nn.Module):
         self.inferred_prefs = None
         self.domain_id = domain_id
 
-        if self.connection is None and self.train_mode == 'train' and (ratings is None or items is None):
-            raise ValueError("❌ DB connection or ratings/items required for training.")
-        if self.connection is None and self.train_mode == 'load':
-            raise ValueError("❌ DB connection required for loading model.")
+        if self.db_config is None and self.train_mode == 'train' and (ratings is None or items is None):
+            raise ValueError("❌ DB config or ratings/items required for training.")
+        if self.db_config is None and self.train_mode == 'load':
+            raise ValueError("❌ DB config required for loading model.")
         if self.train_mode not in ['train', 'load']:
             raise ValueError("❌ train_mode must be 'train' or 'load'")
 
@@ -76,7 +77,6 @@ class LatentFactorModel(nn.Module):
             else:
                 self.ratings, self.test_ratings = ratings, []
 
-            # --- FIX: Handle Empty Ratings ---
             if not self.ratings:
                 print("⚠️ Warning: No training ratings available. Model will initialize with zeros/random.")
                 users_in_train = []
@@ -87,7 +87,6 @@ class LatentFactorModel(nn.Module):
                 users_in_train = list(users_in_train_set)
                 items_in_train = list(items_in_train_set)
 
-            # Only load embeddings if we have data
             if users_in_train and items_in_train:
                 self.load_user_item_embeddings_from_db(users_in_train, items_in_train)
             
@@ -95,7 +94,6 @@ class LatentFactorModel(nn.Module):
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
             
-            # Filter ratings
             if self.ratings:
                 original_count = len(self.ratings)
                 self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
@@ -110,7 +108,6 @@ class LatentFactorModel(nn.Module):
             n_users_final = len(self.users)
             n_items_final = len(self.items_list)
             
-            # Safe init with max(n, 1) to prevent embedding(0) error
             self.model = self.UEIEModel(n_users_final, n_items_final, self.k, self.mu).to(self.device)
 
             self.optimizer = optim.AdamW(self.model.parameters(), 
@@ -123,7 +120,6 @@ class LatentFactorModel(nn.Module):
     class UEIEModel(nn.Module):
         def __init__(self, n_users, n_items, k, mu, P_init=None, Q_init=None, b_u_init=None, b_i_init=None):
             super().__init__()
-            # Fix lỗi dimension: Luôn tối thiểu là 1
             n_users = max(n_users, 1)
             n_items = max(n_items, 1)
 
@@ -133,7 +129,6 @@ class LatentFactorModel(nn.Module):
             self.b_i = nn.Embedding(n_items, 1)
             self.mu = mu
             
-            # --- SAFE COPY LOGIC ---
             with torch.no_grad():
                 if P_init is not None:
                     t = torch.tensor(P_init, dtype=torch.float32)
@@ -209,8 +204,8 @@ class LatentFactorModel(nn.Module):
 
             liked_item_embeddings = []
             for item_id, rating in ratings_list:
-                if rating > tau:
-                    if item_id in self.item_emb_dict:
+                if rating >= tau:
+                    if item_id in self.item_emb_dict and np.any(self.item_emb_dict[item_id] != 0):
                         liked_item_embeddings.append(self.item_emb_dict[item_id])
 
             if liked_item_embeddings:
@@ -220,31 +215,39 @@ class LatentFactorModel(nn.Module):
                 else:
                     self.user_emb_dict[user_id] = t_u
             else:
-                self.user_emb_dict[user_id] = np.zeros(k_dim_bert)
+                all_rated_items = [self.item_emb_dict[i] for i, _ in ratings_list if i in self.item_emb_dict and np.any(self.item_emb_dict[i] != 0)]
+                if all_rated_items:
+                    self.user_emb_dict[user_id] = np.mean(all_rated_items, axis=0)
+                else:
+                    self.user_emb_dict[user_id] = np.zeros(k_dim_bert)
                 
+    # THAY ĐỔI: Sử dụng with psycopg2.connect
     def load_user_item_from_db(self):
-        cur = self.connection.cursor()
         try:
-            cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
-            self.users = [str(row[0]) for row in cur.fetchall()]
-            
-            cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
-            self.items_list = [str(row[0]) for row in cur.fetchall()]
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT "Id" From "User" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.users = [str(row[0]) for row in cur.fetchall()]
+                    
+                    cur.execute('SELECT "Id" From "Item" WHERE "DomainId" = %s ORDER BY "Id"', (self.domain_id,))
+                    self.items_list = [str(row[0]) for row in cur.fetchall()]
         except Exception as e:
             print(f"⚠️ Error loading users/items: {e}")
             self.users = []
             self.items_list = []
         
+    # THAY ĐỔI: Sử dụng with psycopg2.connect
     def load_ratings_from_db(self, limit_total=1000000, ratio=0.8):
-        cur = self.connection.cursor()
         try:
-            cur.execute("""
-                SELECT "UserId", "ItemId", "Value"
-                FROM "Rating"
-                WHERE "DomainId" = %s AND "Value" IS NOT NULL
-                LIMIT %s
-            """, (self.domain_id, limit_total))
-            rows = cur.fetchall()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "UserId", "ItemId", "Value"
+                        FROM "Rating"
+                        WHERE "DomainId" = %s AND "Value" IS NOT NULL
+                        LIMIT %s
+                    """, (self.domain_id, limit_total))
+                    rows = cur.fetchall()
         except Exception as e:
             print(f"❌ Error querying ratings: {e}")
             rows = []
@@ -261,38 +264,43 @@ class LatentFactorModel(nn.Module):
         self.ratings = [(str(u), str(i), float(r)) for u, i, r in rows[:train_count]]
         self.test_ratings = [(str(u), str(i), float(r)) for u, i, r in rows[train_count:]]
 
+    # THAY ĐỔI: Mở kết nối để query items, tắt, rồi mở lại query users (Tránh giữ kết nối lâu lúc BERT chạy)
     def load_user_item_embeddings_from_db(self, users_to_load, items_to_load):
         if not users_to_load or not items_to_load:
             return
 
-        cur = self.connection.cursor()
         CHUNK_SIZE = 1000
         k_bert_dim = 768
         all_rows_items = []
         items_list_for_query = list(items_to_load)
-        for i in range(0, len(items_list_for_query), CHUNK_SIZE):
-            chunk = items_list_for_query[i : i + CHUNK_SIZE]
-            if not chunk: continue
-            try:
-                cur.execute("""
-                    SELECT "Id", "Description", "EmbeddingVector"
-                    FROM "Item"
-                    WHERE "DomainId" = %s AND "Id" = ANY(%s::int[])
-                """, (self.domain_id, chunk,))
-                rows_chunk = cur.fetchall()
-                all_rows_items.extend(rows_chunk)
-            except Exception as e:
-                print(f"❌ Error querying item chunk starting at index {i}: {e}")
-                raise
+        
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    for i in range(0, len(items_list_for_query), CHUNK_SIZE):
+                        chunk = items_list_for_query[i : i + CHUNK_SIZE]
+                        if not chunk: continue
+                        cur.execute("""
+                            SELECT "Id", 
+                                   COALESCE(NULLIF("Description", ''), "Title") AS "Description", 
+                                   "EmbeddingVector"
+                            FROM "Item"
+                            WHERE "DomainId" = %s AND "Id" = ANY(%s::int[])
+                        """, (self.domain_id, chunk,))
+                        all_rows_items.extend(cur.fetchall())
+        except Exception as e:
+            print(f"❌ Error querying item chunks: {e}")
+            raise
 
         self.item_emb_dict = {}
         missing_items_info = []
         processed_item_ids = set()
         for item_id, desc, emb_vec in all_rows_items:
+            item_id = str(item_id)
             if emb_vec is not None:
                 try:
                     loaded_emb = np.array(emb_vec, dtype=float)
-                    if len(loaded_emb) > 0:
+                    if len(loaded_emb) > 0 and np.any(loaded_emb != 0):
                         self.item_emb_dict[item_id] = loaded_emb
                         k_bert_dim = len(loaded_emb) 
                     else:
@@ -309,6 +317,7 @@ class LatentFactorModel(nn.Module):
             for item_id in items_not_in_db_table:
                 missing_items_info.append((item_id, None))
 
+        # --- Giai đoạn này dùng BERT, KHÔNG CẦN KẾT NỐI DB ---
         if missing_items_info:
             if self.tokenizer is None or self.bert_model is None:
                 try:
@@ -330,25 +339,29 @@ class LatentFactorModel(nn.Module):
         
         all_rows_users = []
         users_list_for_query = list(users_to_load)
-        for i in range(0, len(users_list_for_query), CHUNK_SIZE):
-            chunk = users_list_for_query[i : i + CHUNK_SIZE]
-            if not chunk: continue
-            try:
-                cur.execute("""
-                    SELECT "Id", "UserEmbeddingVector"
-                    FROM "User"
-                    WHERE "DomainId" = %s AND "Id" = ANY(%s::int[])
-                """, (self.domain_id, chunk,))
-                rows_chunk = cur.fetchall()
-                all_rows_users.extend(rows_chunk)
-            except Exception as e:
-                print(f"❌ Error querying user chunk starting at index {i}: {e}")
-                raise
+        
+        # Mở lại kết nối DB để query User 
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    for i in range(0, len(users_list_for_query), CHUNK_SIZE):
+                        chunk = users_list_for_query[i : i + CHUNK_SIZE]
+                        if not chunk: continue
+                        cur.execute("""
+                            SELECT "Id", "UserEmbeddingVector"
+                            FROM "User"
+                            WHERE "DomainId" = %s AND "Id" = ANY(%s::int[])
+                        """, (self.domain_id, chunk,))
+                        all_rows_users.extend(cur.fetchall())
+        except Exception as e:
+            print(f"❌ Error querying user chunks: {e}")
+            raise
 
         self.user_emb_dict = {}
         processed_user_ids = set()
         k_dim_for_user = k_bert_dim
         for user_id, emb_vec in all_rows_users:
+            user_id = str(user_id)
             if emb_vec is not None:
                 try:
                     loaded_emb = np.array(emb_vec, dtype=float)
@@ -367,74 +380,85 @@ class LatentFactorModel(nn.Module):
             for user_id in users_not_in_db_table:
                 self.user_emb_dict[user_id] = np.zeros(k_dim_for_user)
 
+    # THAY ĐỔI: Gộp query vào 1 transaction
     def load_model_from_db(self, model_id):
-        cur = self.connection.cursor()
-        
         item_factors = {}
         item_biases = {}
         temp_k_from_factors = None
+        user_factors = {}
+        user_biases = {}
+        mu_val = 3.5
 
         try:
-            cur.execute("""
-                SELECT "ItemId", "ItemBias", "ItemFactors"
-                FROM "ItemFactor"
-                WHERE "ModelId" = %s
-                ORDER BY "ItemId"
-            """, (model_id,))
-            rows_items = cur.fetchall()
-        except Exception as e:
-            print(f"❌ Error loading items/factors: {e}")
-            raise
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT "ItemId", "ItemBias", "ItemFactors"
+                        FROM "ItemFactor"
+                        WHERE "ModelId" = %s
+                        ORDER BY "ItemId"
+                    """, (model_id,))
+                    rows_items = cur.fetchall()
+                    for item_id, bias, factors in rows_items:
+                        item_id = str(item_id)
+                        if item_id not in self.item2idx: continue
+                        if bias is not None and factors is not None:
+                            item_biases[item_id] = float(bias)
+                            item_factors[item_id] = np.array(factors, dtype=float)
+                            if temp_k_from_factors is None:
+                                temp_k_from_factors = len(item_factors[item_id])
 
-        for item_id, bias, factors in rows_items:
-            item_id = str(item_id)
-            if item_id not in self.item2idx: continue
-            
-            if bias is not None and factors is not None:
-                item_biases[item_id] = float(bias)
-                item_factors[item_id] = np.array(factors, dtype=float)
-                if temp_k_from_factors is None:
-                    temp_k_from_factors = len(item_factors[item_id])
+                    cur.execute("""
+                        SELECT "UserId", "UserBias", "UserFactors"
+                        FROM "UserFactor"
+                        WHERE "ModelId" = %s
+                        ORDER BY "UserId"
+                    """, (model_id,))
+                    rows_users = cur.fetchall()
+                    for user_id, bias, factors in rows_users:
+                        user_id = str(user_id)
+                        if user_id not in self.user2idx: continue
+                        if bias is not None and factors is not None:
+                            user_biases[user_id] = float(bias)
+                            user_factors[user_id] = np.array(factors, dtype=float)
+                            if self.k is None and len(user_factors[user_id]) > 0:
+                                self.k = len(user_factors[user_id])
+
+                    cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
+                    mu_row = cur.fetchone()
+                    if mu_row and mu_row[0] is not None:
+                        mu_val = float(mu_row[0])
+        except Exception as e:
+            print(f"❌ Error loading model state from DB: {e}")
+            raise
 
         if temp_k_from_factors is not None:
             self.k = temp_k_from_factors
             print(f"   Inferred K={self.k} from loaded item factors.")
-
-        user_factors = {}
-        user_biases = {}
-        try:
-            cur.execute("""
-                SELECT "UserId", "UserBias", "UserFactors"
-                FROM "UserFactor"
-                WHERE "ModelId" = %s
-                ORDER BY "UserId"
-            """, (model_id,))
-            rows_users = cur.fetchall()
-        except Exception as e:
-            print(f"❌ Error loading users/factors: {e}")
-            raise
-
-        for user_id, bias, factors in rows_users:
-            user_id = str(user_id)
-            if user_id not in self.user2idx: continue
-            
-            if bias is not None and factors is not None:
-                user_biases[user_id] = float(bias)
-                user_factors[user_id] = np.array(factors, dtype=float)
-                if self.k is None and len(user_factors[user_id]) > 0:
-                    self.k = len(user_factors[user_id])
-
-        if self.k is None:
+        elif self.k is None:
             print("⚠️ Warning: Cannot determine K from loaded factors. Using default.")
 
+        self.mu = mu_val
         n_users_loaded = len(self.users)
         n_items_loaded = len(self.items_list)
         
-        cur.execute('SELECT "AverageRating" FROM "Model" WHERE "Id"=%s', (model_id,))
-        mu_row = cur.fetchone()
-        self.mu = float(mu_row[0]) if mu_row and mu_row[0] is not None else 3.5
+        P_init_arr = np.zeros((n_users_loaded, self.k), dtype=float)
+        Q_init_arr = np.zeros((n_items_loaded, self.k), dtype=float)
+        b_u_init_arr = np.zeros(n_users_loaded, dtype=float)
+        b_i_init_arr = np.zeros(n_items_loaded, dtype=float)
+        
+        for user_id, idx in self.user2idx.items():
+            if user_id in user_factors:
+                P_init_arr[idx] = user_factors[user_id]
+            if user_id in user_biases:
+                b_u_init_arr[idx] = user_biases[user_id]
 
-        # Initialize safely even if 0 users/items
+        for item_id, idx in self.item2idx.items():
+            if item_id in item_factors:
+                Q_init_arr[idx] = item_factors[item_id]
+            if item_id in item_biases:
+                b_i_init_arr[idx] = item_biases[item_id]
+                
         self.model = self.UEIEModel(n_users_loaded, n_items_loaded, self.k, self.mu).to(self.device)
         self.model.eval()
 
@@ -615,103 +639,103 @@ class LatentFactorModel(nn.Module):
 
         print("🏁 Training finished.")
 
+    # THAY ĐỔI: Tự mở/đóng kết nối, xử lý lỗi riêng cho từng phần để tránh crash toàn bộ
     def write_model_to_db(self):
         if self.train_mode != 'train': print("Not in train mode. Skipping save."); return
-        if self.connection is None: raise ValueError("❌ DB connection required.")
+        if self.db_config is None: raise ValueError("❌ DB config required.")
         if self.model is None: print("⚠️ Model not trained. Cannot save."); return
         
-        cur = self.connection.cursor()
         self.model.eval()
         
-        if self.user_emb_dict and self.item_emb_dict:
-            update_count_u, update_count_i = 0, 0
-            try:
-                for user_id in self.users:
-                    if user_id in self.user_emb_dict:
-                        emb = self.user_emb_dict[user_id]
-                        cur.execute('UPDATE "User" SET "UserEmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), user_id))
-                        update_count_u += cur.rowcount
-                for item_id in self.items_list:
-                    if item_id in self.item_emb_dict:
-                        emb = self.item_emb_dict[item_id]
-                        cur.execute('UPDATE "Item" SET "EmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), item_id))
-                        update_count_i += cur.rowcount
-                print(f"Updated embeddings for {update_count_u} users, {update_count_i} items.")
-                self.connection.commit()
-            except Exception as e:
-                print(f"❌ Error updating embeddings: {e}")
-                self.connection.rollback()
-        
         try:
-            with torch.no_grad():
-                all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
-                all_user_factors = self.model.P.weight.cpu().numpy()
-                all_item_biases = self.model.b_i.weight.squeeze().cpu().numpy()
-                all_item_factors = self.model.Q.weight.cpu().numpy()
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    if self.user_emb_dict and self.item_emb_dict:
+                        update_count_u, update_count_i = 0, 0
+                        try:
+                            for user_id in self.users:
+                                if user_id in self.user_emb_dict:
+                                    emb = self.user_emb_dict[user_id]
+                                    cur.execute('UPDATE "User" SET "UserEmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), user_id))
+                                    update_count_u += cur.rowcount
+                            for item_id in self.items_list:
+                                if item_id in self.item_emb_dict:
+                                    emb = self.item_emb_dict[item_id]
+                                    cur.execute('UPDATE "Item" SET "EmbeddingVector"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s', (emb.tolist(), item_id))
+                                    update_count_i += cur.rowcount
+                            print(f"Updated embeddings for {update_count_u} users, {update_count_i} items.")
+                            conn.commit()
+                        except Exception as e:
+                            print(f"❌ Error updating embeddings: {e}")
+                            conn.rollback()
 
-            user_factor_data = []
-            item_factor_data = []
-            
-            users_in_train = set(u for u, _, _ in self.ratings) if self.ratings else set()
-            items_in_train = set(i for _, i, _ in self.ratings) if self.ratings else set()
+                    with torch.no_grad():
+                        all_user_biases = self.model.b_u.weight.squeeze().cpu().numpy()
+                        all_user_factors = self.model.P.weight.cpu().numpy()
+                        all_item_biases = self.model.b_i.weight.squeeze().cpu().numpy()
+                        all_item_factors = self.model.Q.weight.cpu().numpy()
 
-            for user_id in self.users:
-                if user_id in users_in_train:
-                    idx = self.user2idx[user_id]
-                    user_factor_data.append((
-                        user_id, float(all_user_biases[idx]), all_user_factors[idx].tolist(), self.model_id
-                    ))
-                else:
-                    idx = self.user2idx.get(user_id)
-                    if idx is not None:
-                        user_factor_data.append((
-                            user_id, 0.0, all_user_factors[idx].tolist(), self.model_id
-                        ))
-            
-            for item_id in self.items_list:
-                if item_id in items_in_train:
-                    idx = self.item2idx[item_id]
-                    item_factor_data.append((
-                        item_id, float(all_item_biases[idx]), all_item_factors[idx].tolist(), self.model_id
-                    ))
-                else:
-                    idx = self.item2idx.get(item_id)
-                    if idx is not None:
-                        item_factor_data.append((
-                            item_id, 0.0, all_item_factors[idx].tolist(), self.model_id
-                        ))
+                    user_factor_data = []
+                    item_factor_data = []
+                    
+                    users_in_train = set(u for u, _, _ in self.ratings) if self.ratings else set()
+                    items_in_train = set(i for _, i, _ in self.ratings) if self.ratings else set()
 
-            if user_factor_data:
-                sql_user = """
-                INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
-                    "UserBias" = EXCLUDED."UserBias",
-                    "UserFactors" = EXCLUDED."UserFactors";
-                """
-                psycopg2.extras.execute_batch(cur, sql_user, user_factor_data)
+                    for user_id in self.users:
+                        if user_id in users_in_train:
+                            idx = self.user2idx[user_id]
+                            user_factor_data.append((
+                                user_id, float(all_user_biases[idx]), all_user_factors[idx].tolist(), self.model_id
+                            ))
+                        else:
+                            idx = self.user2idx.get(user_id)
+                            if idx is not None:
+                                user_factor_data.append((
+                                    user_id, 0.0, all_user_factors[idx].tolist(), self.model_id
+                                ))
+                    
+                    for item_id in self.items_list:
+                        if item_id in items_in_train:
+                            idx = self.item2idx[item_id]
+                            item_factor_data.append((
+                                item_id, float(all_item_biases[idx]), all_item_factors[idx].tolist(), self.model_id
+                            ))
+                        else:
+                            idx = self.item2idx.get(item_id)
+                            if idx is not None:
+                                item_factor_data.append((
+                                    item_id, 0.0, all_item_factors[idx].tolist(), self.model_id
+                                ))
 
-            if item_factor_data:
-                sql_item = """
-                INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
-                    "ItemBias" = EXCLUDED."ItemBias",
-                    "ItemFactors" = EXCLUDED."ItemFactors";
-                """
-                psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
-            
-            cur = self.connection.cursor()
-            cur.execute("""
-                UPDATE "Model" SET "AverageRating"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s 
-            """, (float(self.mu), self.model_id))
-            
-            self.connection.commit()
-            print(f"Saved model factors. Users: {len(self.user2idx)}, Items: {len(self.item2idx)}")
+                    if user_factor_data:
+                        sql_user = """
+                        INSERT INTO "UserFactor" ("UserId", "UserBias", "UserFactors", "ModelId")
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ("UserId", "ModelId") DO UPDATE SET 
+                            "UserBias" = EXCLUDED."UserBias",
+                            "UserFactors" = EXCLUDED."UserFactors";
+                        """
+                        psycopg2.extras.execute_batch(cur, sql_user, user_factor_data)
+
+                    if item_factor_data:
+                        sql_item = """
+                        INSERT INTO "ItemFactor" ("ItemId", "ItemBias", "ItemFactors", "ModelId")
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ("ItemId", "ModelId") DO UPDATE SET
+                            "ItemBias" = EXCLUDED."ItemBias",
+                            "ItemFactors" = EXCLUDED."ItemFactors";
+                        """
+                        psycopg2.extras.execute_batch(cur, sql_item, item_factor_data)
+                    
+                    cur.execute("""
+                        UPDATE "Model" SET "AverageRating"=%s, "ModifiedAt"=NOW() WHERE "Id"=%s 
+                    """, (float(self.mu), self.model_id))
+                    
+                    conn.commit()
+                    print(f"Saved model factors. Users: {len(self.user2idx)}, Items: {len(self.item2idx)}")
 
         except Exception as e:
             print(f"   ❌ Error saving factors/biases (UPSERT stage): {e}")
-            self.connection.rollback()
     
     def predict(self, user, item, p):
         if self.model is None:

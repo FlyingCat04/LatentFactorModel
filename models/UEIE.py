@@ -87,12 +87,15 @@ class LatentFactorModel(nn.Module):
                 users_in_train = list(users_in_train_set)
                 items_in_train = list(items_in_train_set)
 
-            if users_in_train and items_in_train:
-                self.load_user_item_embeddings_from_db(users_in_train, items_in_train)
+            # if users_in_train and items_in_train:
+            #     self.load_user_item_embeddings_from_db(users_in_train, items_in_train)
             
             self.load_user_item_from_db()
             self.user2idx = {u: i for i, u in enumerate(self.users)}
             self.item2idx = {i: j for j, i in enumerate(self.items_list)}
+            
+            if self.users and self.items_list:
+                self.load_user_item_embeddings_from_db(self.users, self.items_list)
             
             if self.ratings:
                 original_count = len(self.ratings)

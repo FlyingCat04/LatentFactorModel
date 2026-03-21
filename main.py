@@ -7,6 +7,7 @@ from typing import Optional
 from config import settings
 import sys
 import asyncio
+import time
 
 # --- IMPORT ĐẦY ĐỦ CÁC MODEL ---
 try:
@@ -115,7 +116,7 @@ def train_sub_model(ModelClass, name, domain_id, model_id, epochs, batch_size, s
 
 def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, train_submodels):
     print(f"🔌 [Domain {domain_id}] Initializing models...")
-    
+    start = time.perf_counter()
     # 1. Chỉ mở kết nối NHANH để lấy Model IDs
     try:
         with psycopg2.connect(**DB_CONFIG) as conn:
@@ -151,9 +152,9 @@ def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, trai
         if save:
             print(f"💾 [Domain {domain_id}] Saving PLA theta...")
             pla.write_model_to_db()
-        
+        end = time.perf_counter()
         print(f"\n🎉 [Domain {domain_id}] TRAINING SUCCESSFUL! 🎉")
-
+        print(f"Training time: {end - start:.2f}")
     except Exception as e:
         print(f"❌ [Domain {domain_id}] CRITICAL ERROR: {e}")
         import traceback

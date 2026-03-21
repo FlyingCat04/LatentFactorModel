@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 try:
     from .ReviewRating import LatentFactorModel as ReviewModel
@@ -286,6 +287,78 @@ class PLA(nn.Module):
 
         return r_hat, alphas, r_s
 
+    def _build_item_index_cache(self, model):
+        if model is None or getattr(model, "model", None) is None:
+            idx_tensor = torch.full((len(self.items),), -1, device=self.device, dtype=torch.long)
+            valid_mask = torch.zeros(len(self.items), device=self.device, dtype=torch.bool)
+            return idx_tensor, valid_mask
+
+        max_item_idx = model.model.Q.num_embeddings
+        idx_list = []
+        valid_list = []
+        for item_id in self.items:
+            idx = model.item2idx.get(item_id)
+            is_valid = idx is not None and idx < max_item_idx
+            idx_list.append(idx if is_valid else -1)
+            valid_list.append(is_valid)
+
+        idx_tensor = torch.tensor(idx_list, device=self.device, dtype=torch.long)
+        valid_mask = torch.tensor(valid_list, device=self.device, dtype=torch.bool)
+        return idx_tensor, valid_mask
+
+    def _predict_single_model_for_user(self, model, user_id, item_idx_tensor, item_valid_mask):
+        n_items = len(self.items)
+        fallback_mu = float(self.ucinit_model.mu)
+        if model is None or getattr(model, "model", None) is None:
+            return torch.full((n_items,), fallback_mu, device=self.device, dtype=torch.float32)
+
+        m = model.model
+        mu = float(getattr(model, "mu", fallback_mu))
+        u_idx = model.user2idx.get(user_id)
+        user_valid = u_idx is not None and u_idx < m.P.num_embeddings
+
+        if user_valid:
+            u_idx_t = torch.tensor([u_idx], device=self.device, dtype=torch.long)
+            p_u = m.P(u_idx_t).squeeze(0)
+            b_u = m.b_u(u_idx_t).squeeze(0).squeeze(0)
+
+            pred = torch.full((n_items,), mu + b_u.item(), device=self.device, dtype=torch.float32)
+            if item_valid_mask.any():
+                valid_item_idx = item_idx_tensor[item_valid_mask]
+                q_i = m.Q(valid_item_idx)
+                b_i = m.b_i(valid_item_idx).squeeze(dim=-1)
+                dot = torch.matmul(q_i, p_u)
+                pred[item_valid_mask] = mu + b_u + b_i + dot
+        else:
+            pred = torch.full((n_items,), mu, device=self.device, dtype=torch.float32)
+            if item_valid_mask.any():
+                valid_item_idx = item_idx_tensor[item_valid_mask]
+                b_i = m.b_i(valid_item_idx).squeeze(dim=-1)
+                pred[item_valid_mask] = mu + b_i
+
+        return torch.clamp(pred, 1.0, 5.0)
+
+    def _compute_alphas_for_user(self, user_id, review_item_idx_tensor, review_item_valid_mask):
+        n_items = len(self.items)
+        u_idx = self.review_model.user2idx.get(user_id)
+
+        if u_idx is not None and u_idx < self.review_model.model.P.num_embeddings:
+            p_u = self.review_model.model.P(
+                torch.tensor([u_idx], device=self.device, dtype=torch.long)
+            ).squeeze(0)
+        else:
+            p_u = torch.zeros(self.k, device=self.device)
+
+        q_i_full = torch.zeros((n_items, self.k), device=self.device, dtype=torch.float32)
+        if review_item_valid_mask.any():
+            valid_item_idx = review_item_idx_tensor[review_item_valid_mask]
+            q_i_full[review_item_valid_mask] = self.review_model.model.Q(valid_item_idx)
+
+        p_u_full = p_u.unsqueeze(0).expand(n_items, -1)
+        phi = torch.cat([p_u_full, q_i_full], dim=1)
+        logits = torch.matmul(phi, self.theta.t())
+        return F.softmax(logits, dim=1)
+
     def compute_loss(self, r_true, r_hat, alphas):
         main_loss = 0.5 * (r_true - r_hat) ** 2
         
@@ -354,7 +427,7 @@ class PLA(nn.Module):
             if n_batches > 0:
                 epoch_loss /= n_batches
             
-            print(f"Epoch {epoch:02d} | Loss: {epoch_loss:.6f}")
+            # print(f"Epoch {epoch:02d} | Loss: {epoch_loss:.6f}")
 
             if prev_loss is not None and abs(prev_loss - epoch_loss) < tol:
                 print(f"🛑 Early stopping at epoch {epoch}")
@@ -369,55 +442,100 @@ class PLA(nn.Module):
         """
         Calculates predictions for ALL users and items and saves to DB using Batch Insert.
         """
-        if self.db_config is None: return
+        start = time.perf_counter()
+        if self.db_config is None:
+            return
+        if not self.users or not self.items:
+            print("⚠️ No users/items found. Skip saving predictions.")
+            return
+
         print("💾 Saving all predictions to DB (Batch Processing)...")
-        
         batch_data = []
-        batch_size = 2000 
-        
+        batch_size = 10000
+        commit_every_n_batches = 5
+        pending_batches = 0
+        query = """
+            INSERT INTO "Predict" ("UserId", "ItemId", "Value")
+            VALUES %s
+            ON CONFLICT ("UserId", "ItemId") DO UPDATE SET "Value" = EXCLUDED."Value";
+        """
+
+        model_sequence = [
+            self.review_model,
+            self.ueie_model,
+            self.ucinit_model,
+            self.iinit_models[1],
+            self.iinit_models[2],
+            self.iinit_models[3],
+            self.iinit_models[4],
+            self.iinit_models[5],
+            self.iinit_models[6],
+            self.iinit_models[7],
+            self.iinit_models[8],
+        ]
+        item_index_cache = [self._build_item_index_cache(model) for model in model_sequence]
+        review_item_idx_tensor, review_item_valid_mask = item_index_cache[0]
+        items = self.items
+
         self.eval()
-        with torch.no_grad():
-            for u in tqdm(self.users, desc="Predicting"):
-                for i in self.items:
-                    try:
-                        r_hat, _, _ = self.forward(u, i)
-                        val = r_hat.item()
-                        val = max(1.0, min(5.0, val)) # Clip 1-5
-                        batch_data.append((u, i, val))
-                        
-                        if len(batch_data) >= batch_size:
-                            # Mở kết nối ngắn hạn để insert
-                            try:
-                                with psycopg2.connect(**self.db_config) as conn:
-                                    with conn.cursor() as cur:
-                                        query = """
-                                            INSERT INTO "Predict" ("UserId", "ItemId", "Value")
-                                            VALUES %s
-                                            ON CONFLICT ("UserId", "ItemId") DO UPDATE SET "Value" = EXCLUDED."Value";
-                                        """
-                                        psycopg2.extras.execute_values(cur, query, batch_data)
-                                        conn.commit()
-                            except Exception as e:
-                                print(f"❌ Error saving prediction batch: {e}")
-                            batch_data = [] # Reset batch
-                    except Exception:
-                        continue
-            
-            # Insert phần còn lại (nếu có)
-            if batch_data:
-                try:
-                    with psycopg2.connect(**self.db_config) as conn:
-                        with conn.cursor() as cur:
-                            query = """
-                                INSERT INTO "Predict" ("UserId", "ItemId", "Value")
-                                VALUES %s
-                                ON CONFLICT ("UserId", "ItemId") DO UPDATE SET "Value" = EXCLUDED."Value";
-                            """
-                            psycopg2.extras.execute_values(cur, query, batch_data)
-                            conn.commit()
-                except Exception as e:
-                    print(f"❌ Error saving final prediction batch: {e}")
-                    
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    execute_values = psycopg2.extras.execute_values
+                    users = self.users
+
+                    with torch.inference_mode():
+                        for u in tqdm(users, desc="Predicting"):
+                            pred_cols = []
+                            for model, (item_idx_tensor, item_valid_mask) in zip(model_sequence, item_index_cache):
+                                pred_cols.append(
+                                    self._predict_single_model_for_user(model, u, item_idx_tensor, item_valid_mask)
+                                )
+
+                            r_s = torch.stack(pred_cols, dim=1)
+                            alphas = self._compute_alphas_for_user(
+                                u,
+                                review_item_idx_tensor,
+                                review_item_valid_mask,
+                            )
+                            r_hat = torch.sum(alphas * r_s, dim=1) + self.bias
+                            r_hat = torch.clamp(r_hat, 1.0, 5.0)
+                            values = r_hat.detach().cpu().tolist()
+
+                            batch_data.extend((u, i, float(v)) for i, v in zip(items, values))
+
+                            while len(batch_data) >= batch_size:
+                                current_batch = batch_data[:batch_size]
+                                execute_values(
+                                    cur,
+                                    query,
+                                    current_batch,
+                                    page_size=batch_size,
+                                )
+                                del batch_data[:batch_size]
+                                pending_batches += 1
+
+                                if pending_batches >= commit_every_n_batches:
+                                    conn.commit()
+                                    pending_batches = 0
+
+                    if batch_data:
+                        execute_values(
+                            cur,
+                            query,
+                            batch_data,
+                            page_size=len(batch_data),
+                        )
+                    conn.commit()
+        except Exception as e:
+            print(f"❌ Error saving predictions: {e}")
+            return
+
+        end = time.perf_counter()
+        elapsed = end - start
+        minutes = int(elapsed // 60)
+        seconds = elapsed % 60
+        print(f"Saving predict time: {elapsed:.2f}s ({minutes}m {seconds:.2f}s)")
         print("✅ Done saving predictions.")
     
     def predict(self, user, item, p):

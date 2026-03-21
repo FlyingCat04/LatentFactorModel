@@ -153,8 +153,11 @@ def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, trai
             print(f"💾 [Domain {domain_id}] Saving PLA theta...")
             pla.write_model_to_db()
         end = time.perf_counter()
+        elapsed = end - start
+        minutes = int(elapsed // 60)
+        seconds = elapsed % 60
         print(f"\n🎉 [Domain {domain_id}] TRAINING SUCCESSFUL! 🎉")
-        print(f"Training time: {end - start:.2f}")
+        print(f"Training time: {elapsed:.2f}s ({minutes}m {seconds:.2f}s)")
     except Exception as e:
         print(f"❌ [Domain {domain_id}] CRITICAL ERROR: {e}")
         import traceback

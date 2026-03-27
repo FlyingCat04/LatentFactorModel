@@ -34,7 +34,8 @@ class LatentFactorModel(nn.Module):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        self.db_config = db_config
+        # Configuration parameters
+        self.db_config = db_config 
         self.lam = lam
         self.lr = lr
         self.p = p
@@ -44,20 +45,28 @@ class LatentFactorModel(nn.Module):
         self.train_mode = train_mode.lower()
         self.domain_id = domain_id
         
+        # Explicit declaration of all instance variables to prevent AttributeError
         self.model = None
         self.optimizer = None
         self.users = []
         self.items_list = []
         self.user2idx = {}
         self.item2idx = {}
+        self.ratings = []
+        self.test_ratings = []
+        self.ratings_dict = {}
         self.item_categories = defaultdict(list)
+        self.top_p_users = []
+        self.top_v_users = []
         self.mu = 3.5
+        self.n_users = 0
+        self.n_items = 0
         
         if self.db_config is None:
             raise ValueError("Database configuration is required.")
         if self.train_mode not in ['train', 'load']:
             raise ValueError("train_mode must be strictly 'train' or 'load'.")
-        
+
         self._initialize_system(ratings)
 
     def _initialize_system(self, input_ratings):
@@ -93,16 +102,16 @@ class LatentFactorModel(nn.Module):
                 b_u_init_arr = np.zeros(self.n_users)
                 b_i_init_arr = np.zeros(self.n_items)
             else:
+                # Filter ratings to ensure valid indices
                 self.ratings = [(u, i, r) for u, i, r in self.ratings if u in self.user2idx and i in self.item2idx]
                 self.ratings_dict = {(u, i): r for u, i, r in self.ratings}
                 
-                # Check again post-filtering
                 if not self.ratings:
-                     self.mu = 3.5
-                     P_init_arr = np.random.normal(scale=0.01, size=(self.n_users, self.k))
-                     Q_init_arr = np.random.normal(scale=0.01, size=(self.n_items, self.k))
-                     b_u_init_arr = np.zeros(self.n_users)
-                     b_i_init_arr = np.zeros(self.n_items)
+                    self.mu = 3.5
+                    P_init_arr = np.random.normal(scale=0.01, size=(self.n_users, self.k))
+                    Q_init_arr = np.random.normal(scale=0.01, size=(self.n_items, self.k))
+                    b_u_init_arr = np.zeros(self.n_users)
+                    b_i_init_arr = np.zeros(self.n_items)
                 else:
                     self.load_item_categories()
                     self.mu = np.mean([r for _, _, r in self.ratings])
@@ -118,7 +127,7 @@ class LatentFactorModel(nn.Module):
                     b_u_init_arr = np.array([b_u_map.get(u, 0.0) for u in self.users])
                     b_i_init_arr = np.array([b_i_map.get(i, 0.0) for i in self.items_list])
 
-            # Initialize Neural Network Architecture
+            # Initialize Neural Network Architecture securely
             self.model = self.UCInitModel(
                 max(self.n_users, 1), max(self.n_items, 1), self.k, self.mu, 
                 P_init_arr, Q_init_arr, b_u_init_arr, b_i_init_arr
@@ -194,8 +203,7 @@ class LatentFactorModel(nn.Module):
             with psycopg2.connect(**self.db_config) as conn:
                 with conn.cursor() as cur:
                     cur.execute('SELECT * FROM "Category"')
-                    rows = cur.fetchall()
-                    for row in rows:
+                    for row in cur.fetchall():
                         category_name[row[0]] = row[1]
                     
                     if not self.items_list: 
@@ -220,7 +228,7 @@ class LatentFactorModel(nn.Module):
                             if cid in category_name:
                                 self.item_categories[str(iid)].append(category_name[cid])
         except Exception:
-            pass # Suppressed to maintain execution flow
+            pass # Fails silently to prevent background task interruption
 
     def load_ratings_from_db(self, limit_total=1000000, ratio=1.0):
         """Retrieves explicit ratings from the database."""
@@ -311,7 +319,7 @@ class LatentFactorModel(nn.Module):
         self.model.eval()
 
     def write_model_to_db(self):
-        """Persists trained vectors to the database."""
+        """Persists trained vectors to the database using Batch UPSERT."""
         if self.train_mode != 'train' or self.model is None or self.db_config is None: 
             return
 
@@ -371,7 +379,7 @@ class LatentFactorModel(nn.Module):
 
     # -------------------------------------------------------------------------
     # UCInit Core Algorithm
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     def _get_top_p_users(self):
         """Identifies the top 'p' most active users based on rating frequency."""
         if not self.ratings: return []
@@ -385,13 +393,18 @@ class LatentFactorModel(nn.Module):
         if not self.ratings: return []
         self.v = min(self.v, self.n_users)
 
+        # Convert categories to a standardized string representation
         try:
             item_to_cat_string = {item: ",".join(self.item_categories[item]) for item in self.items_list}
         except TypeError:
-            item_to_cat_string = {item: ",".join(self.item_categories[item]) if self.item_categories[item] else "" for item in self.items_list}
+            item_to_cat_string = {
+                item: ",".join(self.item_categories.get(item, [])) if self.item_categories.get(item) else "" 
+                for item in self.items_list
+            }
         
         categories = sorted(list(set(item_to_cat_string.values())))
         n_categories = len(categories)
+        
         if n_categories == 0:
             shuffled_users = list(self.users)
             np.random.shuffle(shuffled_users)
@@ -439,7 +452,7 @@ class LatentFactorModel(nn.Module):
 
     def _UCInit(self):
         """Constructs P and Q matrices initialized by top diverse users."""
-        top_v_idx = [self.user2idx[u] for u in self.top_v_users]
+        top_v_idx = [self.user2idx[u] for u in self.top_v_users if u in self.user2idx]
         R = lil_matrix((self.n_users, self.n_items), dtype=np.float32)
         
         for u, i, r in self.ratings:
@@ -498,10 +511,9 @@ class LatentFactorModel(nn.Module):
         tolerance = 1e-6
         prev_avg_loss = float("inf")
 
-        user_indices = [self.user2idx[u] for u, _, _ in self.ratings]
-        item_indices = [self.item2idx[i] for _, i, _ in self.ratings]
-        user_idx_all = torch.tensor(user_indices, device=self.device, dtype=torch.long)
-        item_idx_all = torch.tensor(item_indices, device=self.device, dtype=torch.long)
+        # Explicitly declare and convert to tensors to match exactly
+        u_all = torch.tensor([self.user2idx[u] for u, _, _ in self.ratings], device=self.device, dtype=torch.long)
+        i_all = torch.tensor([self.item2idx[i] for _, i, _ in self.ratings], device=self.device, dtype=torch.long)
         r_all = torch.tensor([r for _, _, r in self.ratings], device=self.device, dtype=torch.float32)
 
         for _ in range(epochs):

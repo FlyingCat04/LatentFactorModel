@@ -161,6 +161,8 @@ def run_training_task(domain_id, epochs, pla_epochs, batch_size, tol, save, trai
             # Commit final changes if all steps succeeded
             conn.commit()
 
+            print(f"[Domain {domain_id}] training done.")
+
         except Exception as inner_e:
             # Rollback active transaction if an internal logical error occurs
             if conn:
